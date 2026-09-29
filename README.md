@@ -1,4 +1,4 @@
-# SIGNAL-> Music Visualizer
+# SIGNAL-> Music Visualizer 
 
 A local, no-backend, no-framework audio visualizer that captures **browser tab audio**
 and renders it in real time across eleven visualization modes, plus an Auto mode
@@ -6,7 +6,7 @@ that picks (and tunes) one for you. Built with plain HTML, CSS, and vanilla
 JavaScript — no build step, no dependencies.
 
 Everything happens on-device. Audio is analyzed in the browser via the Web
-Audio API and never leaves the machine.
+Audio API and never leaves the machine. Window
 
 ---
 
