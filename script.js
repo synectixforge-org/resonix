@@ -288,21 +288,65 @@ class AudioEngine {
   }
 
   /** Get averaged energy (0-255) for a Hz range. */
-  /** Log-spaced frequency bands, generated on demand for any row count
-   *  (Orchestra Mode 2 / Line Graph 2 when the row slider goes past 7).
-   *  Unlike bandDefs these aren't named/curated — just evenly divided in
-   *  log space between 20Hz and Nyquist — but they're just as fine-grained
-   *  regardless of FFT size, since getBandEnergy already averages whatever
-   *  bins fall in range. */
+  /** More detailed version of bandDefs, generated on demand for any row
+   *  count above 7 (Orchestra Mode 2 / Line Graph 2 / Meter Bank 2's row
+   *  slider). Rather than blindly slicing the whole spectrum into unlabeled
+   *  ranges, each of the 7 real bands (Sub Bass, Bass, Low Mid, Mid, High
+   *  Mid, Presence, Brilliance) gets split into that many numbered
+   *  sub-rows — "Bass 1" / "Bass 2" / "Bass 3" and so on — so a row's label
+   *  still tells you what part of the mix it's showing. Bands that span
+   *  more octaves (e.g. Brilliance: 6kHz-20kHz) get more sub-rows than
+   *  narrow ones (e.g. Sub Bass: 20-60Hz) in proportion, since that's where
+   *  there's actually more going on to resolve. This is just a finer label
+   *  scheme on top of the same raw bins — resolution comes from
+   *  getBandEnergy averaging whatever falls in each narrower range, which
+   *  works at any FFT size. */
   getDynamicBands(count) {
-    const nyq = Math.min(20000, (this.sampleRate || 44100) / 2);
-    const loHz = 20;
-    const n = Math.max(3, Math.round(count));
+    const base = this.bandDefs;
+    const n = Math.max(base.length, Math.round(count));
+    const extra = n - base.length;
+
+    const weights = base.map(b => Math.log2(b.hi / b.lo)); // octaves spanned
+    const totalWeight = weights.reduce((a, b) => a + b, 0);
+    const raw = weights.map(w => (w / totalWeight) * extra);
+    const counts = raw.map(Math.floor);
+    let used = counts.reduce((a, b) => a + b, 0);
+    const byRemainder = raw
+      .map((r, i) => ({ i, frac: r - counts[i] }))
+      .sort((a, b) => b.frac - a.frac);
+    for (let k = 0; used < extra; k++, used++) counts[byRemainder[k % byRemainder.length].i]++;
+
     const bands = [];
-    for (let i = 0; i < n; i++) {
-      const lo = loHz * Math.pow(nyq / loHz, i / n);
-      const hi = loHz * Math.pow(nyq / loHz, (i + 1) / n);
-      bands.push({ name: Util.formatHz((lo + hi) / 2) + 'Hz', lo, hi, icon: null });
+    base.forEach((band, bi) => {
+      const k = counts[bi] + 1; // every band keeps at least its own row
+      for (let j = 0; j < k; j++) {
+        const lo = band.lo * Math.pow(band.hi / band.lo, j / k);
+        const hi = band.lo * Math.pow(band.hi / band.lo, (j + 1) / k);
+        bands.push({
+          name: k === 1 ? band.name : `${band.name} ${j + 1}`,
+          lo: Math.round(lo),
+          hi: Math.round(hi),
+          icon: band.icon,
+        });
+      }
+    });
+    return bands;
+  }
+
+  /** Fixed band set used by Meter Bank 2: the normal 7 bands, except Bass
+   *  (60-250Hz) is always split into 3 log-spaced sub-rows — Bass 1, Bass 2,
+   *  Bass 3 — regardless of any row-count setting. Everything else stays
+   *  exactly as it is in bandDefs, one row each. 9 rows total, fixed. */
+  getMeterBank2Bands() {
+    const bands = [];
+    for (const band of this.bandDefs) {
+      if (band.name !== 'Bass') { bands.push(band); continue; }
+      const k = 3;
+      for (let j = 0; j < k; j++) {
+        const lo = band.lo * Math.pow(band.hi / band.lo, j / k);
+        const hi = band.lo * Math.pow(band.hi / band.lo, (j + 1) / k);
+        bands.push({ name: `Bass ${j + 1}`, lo: Math.round(lo), hi: Math.round(hi), icon: band.icon });
+      }
     }
     return bands;
   }
@@ -430,7 +474,7 @@ class ThemeManager {
       { id: 'cyberpunk', label: 'Cyberpunk' },
       { id: 'rainbow', label: 'Rainbow (live cycle)' },
     ];
-    this.current = 'phosphor';
+    this.current = 'deep-space';
     this.lightMode = false;
   }
 
@@ -631,7 +675,10 @@ class SpectrumBars extends Visualizer {
   draw(audio, now) {
     const ctx = this.ctx;
     const { width, height } = this;
-    const barCount = this.settings.get('barCount');
+    // Capped at 128: past that, bars get too thin to read even though the
+    // shared slider goes up to 256 (other modes, like Circular Spectrum,
+    // use the higher end fine).
+    const barCount = Math.min(128, this.settings.get('barCount'));
     const mirror = this.settings.get('mirrorMode');
     const peakHoldTime = this.settings.get('peakHoldTime');
 
@@ -728,6 +775,149 @@ class SpectrumBars extends Visualizer {
     }
     ctx.closePath();
     ctx.fill();
+  }
+
+  reset() {
+    if (this.peaks) this.peaks.fill(0);
+    if (this.smoothedBars) this.smoothedBars.fill(0);
+  }
+}
+
+
+/* ---------------- MODE 1b: SPECTRUM BARS 2 (LED block segments) ----------------
+   Same frequency-column layout and peak-hold logic as Spectrum Bars, but
+   each column is a stack of small lit/unlit blocks (classic hardware
+   equalizer look) instead of one solid bar — the same idea used for
+   Meter Bank 2's segmented meters, applied to the main spectrum view. */
+class SpectrumBarsBlocks extends Visualizer {
+  constructor(ctx, settings, theme) {
+    super(ctx, settings, theme);
+    this.peaks = null;
+    this.peakVelocity = null;
+    this.peakHoldUntil = null;
+    this.smoothedBars = null;
+  }
+
+  _ensureArrays(count) {
+    if (!this.peaks || this.peaks.length !== count) {
+      this.peaks = new Float32Array(count);
+      this.peakVelocity = new Float32Array(count);
+      this.peakHoldUntil = new Float32Array(count);
+      this.smoothedBars = new Float32Array(count);
+    }
+  }
+
+  draw(audio, now) {
+    const ctx = this.ctx;
+    const { width, height } = this;
+    // Capped at 32: each bar here is already a stack of small segments, so
+    // packing in as many columns as the shared slider allows (up to 256)
+    // would leave no room for the blocks themselves to read.
+    const barCount = Math.min(32, this.settings.get('barCount'));
+    const mirror = this.settings.get('mirrorMode');
+    const peakHoldTime = this.settings.get('peakHoldTime');
+
+    this._ensureArrays(barCount);
+
+    const freq = audio.freqData;
+    const binCount = freq.length;
+    const gap = Math.max(1, width / barCount * 0.18);
+    const barWidth = (width / barCount) - gap;
+
+    const colors = this.theme.getAccentColors();
+    const baseline = mirror ? height / 2 : height;
+    const availH = (mirror ? height / 2 : height) - 4;
+
+    const segGap = Util.clamp(barWidth * 0.14, 1, 3);
+    const segH = Util.clamp(barWidth * 0.6, 3, 16);
+    const segCount = Math.max(6, Math.floor((availH + segGap) / (segH + segGap)));
+
+    ctx.clearRect(0, 0, width, height);
+
+    for (let i = 0; i < barCount; i++) {
+      // Same log-scaled bin mapping as the original Spectrum Bars.
+      const t0 = i / barCount;
+      const t1 = (i + 1) / barCount;
+      const startBin = Math.floor(Math.pow(t0, 1.6) * binCount);
+      const endBin = Math.max(startBin + 1, Math.floor(Math.pow(t1, 1.6) * binCount));
+
+      let sum = 0, cnt = 0;
+      for (let b = startBin; b < endBin && b < binCount; b++) { sum += freq[b]; cnt++; }
+      const raw = (cnt > 0 ? sum / cnt : 0) / 255 * audio.sensitivity;
+
+      const prev = this.smoothedBars[i];
+      const diff = raw - prev;
+      const smoothed = prev + diff * (diff > 0 ? 0.55 : 0.18);
+      this.smoothedBars[i] = smoothed;
+
+      const frac = Util.clamp(smoothed, 0, 1);
+      const x = i * (barWidth + gap);
+
+      // Peak hold + fall-off (fractional, same shape as the original's
+      // pixel-based version)
+      if (frac >= this.peaks[i]) {
+        this.peaks[i] = frac;
+        this.peakVelocity[i] = 0;
+        this.peakHoldUntil[i] = now + peakHoldTime;
+      } else if (now > this.peakHoldUntil[i]) {
+        this.peakVelocity[i] += 0.012;
+        this.peaks[i] = Math.max(frac, this.peaks[i] - this.peakVelocity[i]);
+      }
+
+      this._drawColumn(ctx, x, baseline, barWidth, -1, frac, this.peaks[i], segCount, segH, segGap, colors);
+      if (mirror) {
+        ctx.globalAlpha = 0.45;
+        this._drawColumn(ctx, x, baseline, barWidth, 1, frac, this.peaks[i], segCount, segH, segGap, colors);
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  /** dir=-1 grows up from baseline (main column); dir=1 grows down (the
+   *  dimmed mirror reflection below baseline). Segments are colored in
+   *  the same green/amber/red zones as Meter Bank 2, with the lit segment
+   *  nearest the peak given a brighter highlight. */
+  _drawColumn(ctx, x, baseline, w, dir, frac, peak, segCount, segH, segGap, colors) {
+    const lit = Math.round(frac * segCount);
+    const peakSeg = Math.round(peak * segCount);
+    const r = Math.min(w / 2, 2);
+
+    for (let s = 0; s < segCount; s++) {
+      const segFrac = s / segCount;
+      const y = baseline + dir * (s * (segH + segGap) + segH) - (dir === -1 ? 0 : segH);
+      const on = s < lit;
+      const isPeakSeg = s === Math.max(0, peakSeg - 1) && peak > 0.02;
+
+      let col = colors.accent;
+      if (segFrac > 0.88) col = colors.accent2;
+      else if (segFrac > 0.65) col = colors.accent3;
+
+      if (on || isPeakSeg) {
+        ctx.fillStyle = `rgba(${col.r},${col.g},${col.b},${isPeakSeg && !on ? 0.95 : 0.92})`;
+        this._roundRect(ctx, x, y, w, segH, r);
+        ctx.fill();
+        if (on) {
+          ctx.fillStyle = `rgba(255,255,255,${segFrac > 0.65 ? 0.22 : 0.14})`;
+          this._roundRect(ctx, x, y, w, segH * 0.35, r);
+          ctx.fill();
+        }
+      } else {
+        ctx.fillStyle = `rgba(${col.r},${col.g},${col.b},0.08)`;
+        this._roundRect(ctx, x, y, w, segH, r);
+        ctx.fill();
+      }
+    }
+  }
+
+  _roundRect(ctx, x, y, w, h, r) {
+    r = Math.min(r, h / 2, w / 2 > 0 ? w / 2 : r);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
   }
 
   reset() {
@@ -1298,153 +1488,6 @@ class LineGraphV2 extends Visualizer {
   }
 }
 
-/* ---------------- MODE: VITALS GRAPH (VOL / Frequency / Bass / Sub Bass) ---------------- */
-/* A focused, 4-row instrument panel — just the headline numbers rather than
-   a full band breakdown: overall Volume, dominant Frequency, Bass and Sub
-   Bass. Drawn with the same sweep as Line Graph Mode 1 (the trail behind
-   the cursor stays visible back to the start of the current pass; nothing
-   ahead of the cursor is drawn until the sweep reaches it). */
-class VitalsGraph extends Visualizer {
-  static ROWS = [
-    { key: 'vol', label: 'VOL' },
-    { key: 'freq', label: 'FREQUENCY' },
-    { key: 'bass', label: 'BASS' },
-    { key: 'subbass', label: 'SUB BASS' },
-  ];
-
-  constructor(ctx, settings, theme) {
-    super(ctx, settings, theme);
-    this.maxPoints = 220;
-    this.buffers = VitalsGraph.ROWS.map(() => new Float32Array(this.maxPoints));
-    this.writeIndex = 0;
-    this._lastFreqHz = 0;
-  }
-
-  draw(audio) {
-    const ctx = this.ctx;
-    const { width, height } = this;
-    const colors = this.theme.getAccentColors();
-
-    ctx.clearRect(0, 0, width, height);
-
-    const n = this.maxPoints;
-    const step = width / (n - 1);
-    const rows = VitalsGraph.ROWS;
-    const rowCount = rows.length;
-
-    // Normalize each metric to 0-1 for plotting.
-    const volNorm = Util.clamp(audio.metrics.volume / 100, 0, 1);
-    const freqHz = audio.metrics.peakFreq;
-    this._lastFreqHz = freqHz;
-    // Log-scaled across the audible range (20Hz-20kHz) so low and high
-    // notes both register as meaningful movement instead of everything
-    // bunching up near the bottom on a linear scale.
-    const freqNorm = Util.clamp(Math.log10(Math.max(freqHz, 20) / 20) / Math.log10(20000 / 20), 0, 1);
-    const bassNorm = Util.clamp(audio.metrics.bass, 0, 1);
-    const subBand = audio.bandDefs[0]; // "Sub Bass", 20-60Hz
-    const subNorm = Util.clamp(audio.getBandEnergy(subBand.lo, subBand.hi) / 255 * audio.sensitivity, 0, 1);
-    const values = [volNorm, freqNorm, bassNorm, subNorm];
-
-    for (let r = 0; r < rowCount; r++) {
-      this.buffers[r][this.writeIndex] = values[r];
-    }
-
-    const traceColors = [colors.accent2, colors.accent3, colors.accent, colors.accent];
-    const rowGap = 8;
-    const availableHeight = height - rowGap * (rowCount - 1);
-    const rowHeight = availableHeight / rowCount;
-
-    for (let idx = 0; idx < rowCount; idx++) {
-      const buf = this.buffers[idx];
-      const c = traceColors[idx];
-      const rowY = idx * (rowHeight + rowGap);
-      const baseY = rowY + rowHeight - 9;
-      const topY = rowY + 9;
-      const ampRange = baseY - topY;
-
-      // Row background card
-      ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},0.04)`;
-      ctx.fillRect(0, rowY, width, rowHeight);
-
-      // Per-row grid
-      ctx.strokeStyle = `rgba(${c.r},${c.g},${c.b},0.08)`;
-      ctx.lineWidth = 1;
-      const gridLines = 4;
-      for (let g = 0; g <= gridLines; g++) {
-        const y = topY + (ampRange / gridLines) * g;
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
-      }
-      const cols = 14;
-      for (let g = 0; g <= cols; g++) {
-        const x = (width / cols) * g;
-        ctx.beginPath(); ctx.moveTo(x, rowY); ctx.lineTo(x, rowY + rowHeight); ctx.stroke();
-      }
-
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(0, rowY, width, rowHeight);
-      ctx.clip();
-
-      ctx.lineWidth = 2;
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      this.applyGlow(`rgba(${c.r},${c.g},${c.b},0.6)`, 0.5);
-
-      // Same trail behavior as Line Graph Mode 1: the whole swept-so-far
-      // portion (left of the cursor) stays visible, fading only gently;
-      // nothing ahead of the cursor (right) is drawn until the sweep
-      // actually reaches it.
-      for (let i = 1; i <= this.writeIndex; i++) {
-        const prevIdx = i - 1;
-        const age = this.writeIndex - i;
-        const alpha = 0.4 + 0.6 * (1 - age / Math.max(1, this.writeIndex));
-        const x0 = prevIdx * step, x1 = i * step;
-        const y0 = baseY - buf[prevIdx] * ampRange;
-        const y1 = baseY - buf[i] * ampRange;
-        ctx.strokeStyle = `rgba(${c.r},${c.g},${c.b},${alpha})`;
-        ctx.beginPath();
-        ctx.moveTo(x0, y0);
-        ctx.lineTo(x1, y1);
-        ctx.stroke();
-      }
-      this.clearGlow();
-
-      // Sweep cursor dot
-      const cx = this.writeIndex * step;
-      const cy = baseY - buf[this.writeIndex] * ampRange;
-      ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},1)`;
-      ctx.beginPath();
-      ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.restore();
-
-      // Row label + live readout — VOL/BASS/SUB BASS read as %, FREQUENCY
-      // reads as the actual dominant Hz rather than a normalized number.
-      ctx.font = '600 11px "JetBrains Mono", monospace';
-      ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},0.9)`;
-      ctx.fillText(rows[idx].label, 10, rowY + 16);
-
-      const readout = rows[idx].key === 'freq'
-        ? `${Util.formatHz(this._lastFreqHz)}Hz`
-        : `${Math.round(buf[this.writeIndex] * 100)}%`;
-      ctx.font = '500 10px "JetBrains Mono", monospace';
-      ctx.textAlign = 'right';
-      ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},0.7)`;
-      ctx.fillText(readout, width - 10, rowY + 16);
-      ctx.textAlign = 'left';
-    }
-
-    this.writeIndex = (this.writeIndex + 1) % n;
-  }
-
-  reset() {
-    for (const buf of this.buffers) buf.fill(0);
-    this.writeIndex = 0;
-    this._lastFreqHz = 0;
-  }
-}
-
 /* ---------------- MODE 5: PARTICLE VISUALIZER ---------------- */
 class ParticleViz extends Visualizer {
   constructor(ctx, settings, theme) {
@@ -1567,6 +1610,39 @@ class OrchestraBase extends Visualizer {
         ctx.closePath(); ctx.fill(); break;
       case 'presence':
         ctx.beginPath(); ctx.moveTo(-s, -s * 0.5); ctx.lineTo(s, -s * 0.5); ctx.lineTo(0, s); ctx.closePath(); ctx.fill(); break;
+      case 'volume':
+        // three ascending bars — a plain signal/level glyph
+        ctx.fillRect(-s * 0.95, s * 0.15, s * 0.5, s * 0.65);
+        ctx.fillRect(-s * 0.2, -s * 0.35, s * 0.5, s * 1.15);
+        ctx.fillRect(s * 0.55, -s * 0.85, s * 0.5, s * 1.65);
+        break;
+      case 'freq':
+        // small sine-wave glyph
+        ctx.beginPath();
+        ctx.moveTo(-s, 0);
+        ctx.bezierCurveTo(-s * 0.5, -s * 1.3, -s * 0.15, s * 1.3, s * 0.1, 0);
+        ctx.bezierCurveTo(s * 0.35, -s * 1.3, s * 0.65, s * 1.3, s, 0);
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        break;
+      case 'peak':
+        // a single sharp spike — the loudest instant, not a smoothed level
+        ctx.beginPath(); ctx.moveTo(-s, s * 0.7); ctx.lineTo(0, -s); ctx.lineTo(s, s * 0.7); ctx.closePath(); ctx.fill();
+        break;
+      case 'range':
+        // double-headed vertical arrow — the spread between peak and average
+        ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(0, -s); ctx.lineTo(0, s); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(-s * 0.4, -s * 0.6); ctx.lineTo(0, -s); ctx.lineTo(s * 0.4, -s * 0.6); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(-s * 0.4, s * 0.6); ctx.lineTo(0, s); ctx.lineTo(s * 0.4, s * 0.6); ctx.stroke();
+        break;
+      case 'bpm':
+        // a heartbeat/pulse zigzag
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(-s, 0); ctx.lineTo(-s * 0.35, 0); ctx.lineTo(-s * 0.1, -s); ctx.lineTo(s * 0.2, s); ctx.lineTo(s * 0.45, 0); ctx.lineTo(s, 0);
+        ctx.stroke();
+        break;
       case 'brilliance':
       default:
         for (let i = 0; i < 4; i++) {
@@ -1582,8 +1658,66 @@ class OrchestraBase extends Visualizer {
     ctx.restore();
   }
 
-  /** Shared left-column icon + label + Hz-range caption, identical in both variants. */
-  _drawLeftColumn(ctx, band, y, rowHeight, colors, smoothed) {
+
+  /** A classic LED/VU-style bank of individually lit segments instead of one
+   *  continuous bar (used by Meter Bank 2 and Signal Meter) — a lot more
+   *  "bars" to look at per row, and the per-segment coloring (green through
+   *  the middle, amber near the top, red at the very top) reads peaks at a
+   *  glance the way a single smooth bar doesn't. `valueLabelOverride` lets a
+   *  row show something other than dB (e.g. "67%" or "212Hz"). */
+  _drawSegmentedMeter(ctx, width, rightColW, y, rowHeight, smoothed, peak, colors, c, valueLabelOverride) {
+    const pad = 10;
+    const meterX = width - rightColW + pad;
+    const meterW = rightColW - pad * 1.6;
+    const segGap = rowHeight > 24 ? 3 : 2;
+    const segH = Util.clamp(rowHeight * 0.6, 8, 28);
+    const meterY = y + rowHeight / 2 - segH / 2;
+    const segW = Util.clamp((rowHeight > 24 ? 10 : 7), 4, 14);
+    const segCount = Math.max(8, Math.floor((meterW + segGap) / (segW + segGap)));
+    const lit = Math.round(Util.clamp(smoothed, 0, 1) * segCount);
+    const peakSeg = Math.round(Util.clamp(peak, 0, 1) * segCount);
+
+    for (let s = 0; s < segCount; s++) {
+      const x = meterX + s * (segW + segGap);
+      const frac = s / segCount;
+      const on = s < lit;
+      const isPeakSeg = s === Math.max(0, peakSeg - 1) && peak > 0.02;
+      let col = c;
+      if (frac > 0.88) col = colors.accent2;       // red zone near the top
+      else if (frac > 0.65) col = colors.accent3;  // amber zone
+
+      if (on || isPeakSeg) {
+        ctx.fillStyle = `rgba(${col.r},${col.g},${col.b},${isPeakSeg && !on ? 0.95 : 0.92})`;
+        this._roundRect(ctx, x, meterY, segW, segH, 2);
+        ctx.fill();
+        if (on) {
+          ctx.fillStyle = `rgba(255,255,255,${frac > 0.65 ? 0.22 : 0.14})`;
+          this._roundRect(ctx, x, meterY, segW, segH * 0.4, 2);
+          ctx.fill();
+        }
+      } else {
+        ctx.fillStyle = `rgba(${col.r},${col.g},${col.b},0.08)`;
+        this._roundRect(ctx, x, meterY, segW, segH, 2);
+        ctx.fill();
+      }
+    }
+
+    const label = valueLabelOverride !== undefined
+      ? valueLabelOverride
+      : `${smoothed > 0.001 ? (20 * Math.log10(smoothed)).toFixed(0) : '-∞'}dB`;
+    ctx.font = `500 9px "JetBrains Mono", monospace`;
+    ctx.fillStyle = `rgba(${colors.accent.r},${colors.accent.g},${colors.accent.b},0.6)`;
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, width - 4, y + rowHeight / 2);
+    ctx.textAlign = 'left';
+  }
+
+  /** Shared left-column icon + label + caption, identical in both variants.
+   *  By default the caption is the band's Hz range; pass `captionOverride`
+   *  for a row that isn't a frequency band at all (e.g. Meter Bank 2's
+   *  Volume/Frequency rows), to show a live reading instead. */
+  _drawLeftColumn(ctx, band, y, rowHeight, colors, smoothed, captionOverride) {
     ctx.save();
     ctx.fillStyle = `rgba(${colors.accent.r},${colors.accent.g},${colors.accent.b},${0.5 + smoothed * 0.5})`;
     ctx.font = '600 12px "Space Grotesk", sans-serif';
@@ -1593,7 +1727,10 @@ class OrchestraBase extends Visualizer {
     ctx.fillText(band.name, 40, y + rowHeight / 2);
     ctx.font = '400 9px "JetBrains Mono", monospace';
     ctx.fillStyle = `rgba(${colors.accent.r},${colors.accent.g},${colors.accent.b},0.45)`;
-    ctx.fillText(`${band.lo}–${band.hi >= 1000 ? (band.hi / 1000) + 'k' : band.hi}Hz`, 40, y + rowHeight / 2 + 13);
+    const caption = captionOverride !== undefined
+      ? captionOverride
+      : `${band.lo}–${band.hi >= 1000 ? (band.hi / 1000) + 'k' : band.hi}Hz`;
+    ctx.fillText(caption, 40, y + rowHeight / 2 + 13);
     ctx.restore();
   }
 
@@ -1987,6 +2124,160 @@ class MeterBankViz extends OrchestraBase {
     this.bandPeaks.fill(0);
   }
 }
+
+class MeterBankV2 extends OrchestraBase {
+  constructor(ctx, settings, theme) {
+    super(ctx, settings, theme);
+    this.rowCount = 0; // forces _ensureRows to allocate on first draw
+    this._ensureRows(9);
+  }
+
+  _ensureRows(rowCount) {
+    if (rowCount === this.rowCount) return;
+    this.rowCount = rowCount;
+    this.bandSmoothed = new Float32Array(rowCount);
+    this.bandPeaks = new Float32Array(rowCount);
+    this.bandPeakHold = new Float32Array(rowCount);
+  }
+
+  draw(audio, now) {
+    const ctx = this.ctx;
+    const { width, height } = this;
+    const colors = this.theme.getAccentColors();
+    const bands = audio.getMeterBank2Bands();
+    this._ensureRows(bands.length);
+    const rowCount = bands.length;
+    const rowGap = rowCount > 16 ? 3 : rowCount > 10 ? 5 : 8;
+    const rowHeight = (height - rowGap * (rowCount - 1)) / rowCount;
+    const showLabels = rowHeight >= 20; // too thin to carry a left column once rows pile up
+
+    ctx.clearRect(0, 0, width, height);
+
+    const leftColW = showLabels ? Math.min(170, width * 0.26) : 0;
+    const rightColW = width - leftColW;
+
+    for (let i = 0; i < rowCount; i++) {
+      const band = bands[i];
+      const y = i * (rowHeight + rowGap);
+      const energy = audio.getBandEnergy(band.lo, band.hi) / 255 * audio.sensitivity;
+
+      const prev = this.bandSmoothed[i];
+      const smoothed = prev + (energy - prev) * (energy > prev ? 0.5 : 0.1);
+      this.bandSmoothed[i] = smoothed;
+
+      if (smoothed >= this.bandPeaks[i]) {
+        this.bandPeaks[i] = smoothed;
+        this.bandPeakHold[i] = now + 900;
+      } else if (now > this.bandPeakHold[i]) {
+        this.bandPeaks[i] = Math.max(smoothed, this.bandPeaks[i] - 0.006);
+      }
+
+      const t = rowCount > 1 ? i / (rowCount - 1) : 0;
+      const c = t < 0.4 ? colors.accent : t < 0.75 ? colors.accent3 : colors.accent2;
+
+      if (showLabels) {
+        this._drawLeftColumn(ctx, band, y, rowHeight, colors, smoothed);
+      } else {
+        ctx.font = '400 9px "JetBrains Mono", monospace';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = `rgba(${colors.accent.r},${colors.accent.g},${colors.accent.b},0.55)`;
+        ctx.fillText(band.name, 4, y + rowHeight / 2);
+      }
+      this._drawSegmentedMeter(ctx, width, rightColW, y, rowHeight, smoothed, this.bandPeaks[i], colors, c);
+    }
+  }
+
+  reset() {
+    this.bandSmoothed.fill(0);
+    this.bandPeaks.fill(0);
+  }
+}
+
+/* ---------------- MODE: SIGNAL METER (Volume / Frequency + 3 essentials) ----------------
+   A dedicated, always-5-row segmented meter bank for the handful of
+   headline numbers that aren't really "frequency bands" — the same ones
+   shown in the topbar readouts (Volume, Frequency, BPM) plus two more that
+   round out the picture: Peak (how hot the loudest instant is, distinct
+   from the smoothed Volume reading) and Dynamic Range (the gap between
+   peak and average level — a compressed, loud-all-the-way-through track
+   reads near 0, a track with real quiet/loud contrast reads higher). */
+class SignalMeter extends OrchestraBase {
+  constructor(ctx, settings, theme) {
+    super(ctx, settings, theme);
+    this.rowCount = 5;
+    this.bandSmoothed = new Float32Array(this.rowCount);
+    this.bandPeaks = new Float32Array(this.rowCount);
+    this.bandPeakHold = new Float32Array(this.rowCount);
+  }
+
+  draw(audio, now) {
+    const ctx = this.ctx;
+    const { width, height } = this;
+    const colors = this.theme.getAccentColors();
+    const rowCount = this.rowCount;
+    const rowGap = 10;
+    const rowHeight = (height - rowGap * (rowCount - 1)) / rowCount;
+    const showLabels = rowHeight >= 20;
+
+    ctx.clearRect(0, 0, width, height);
+
+    const leftColW = showLabels ? Math.min(170, width * 0.26) : 0;
+    const rightColW = width - leftColW;
+
+    const m = audio.metrics;
+    const freqHz = m.peakFreq;
+    const freqNorm = Util.clamp(Math.log10(Math.max(freqHz, 20) / 20) / Math.log10(20000 / 20), 0, 1);
+    // Crest factor (peak-to-average, in dB) as a 0-20dB range mapped to 0-1.
+    const crestDb = (m.peak > 0.001 && m.average > 0.001) ? 20 * Math.log10(m.peak / m.average) : 0;
+    const crestNorm = Util.clamp(crestDb / 20, 0, 1);
+    const bpm = audio.bpm;
+    const bpmNorm = Util.clamp(bpm / 200, 0, 1);
+
+    const rows = [
+      { name: 'Volume', icon: 'volume', energy: Util.clamp(m.volume / 100, 0, 1), label: `${Math.round(m.volume)}%` },
+      { name: 'Frequency', icon: 'freq', energy: freqNorm, label: `${Util.formatHz(freqHz)}Hz` },
+      { name: 'Peak', icon: 'peak', energy: Util.clamp(m.peak, 0, 1), label: `${Math.round(m.peak * 100)}%` },
+      { name: 'Dynamic Range', icon: 'range', energy: crestNorm, label: `${crestDb.toFixed(1)}dB` },
+      { name: 'BPM', icon: 'bpm', energy: bpmNorm, label: bpm > 0 ? `${Math.round(bpm)}` : '—' },
+    ];
+
+    for (let i = 0; i < rowCount; i++) {
+      const row = rows[i];
+      const y = i * (rowHeight + rowGap);
+
+      const prev = this.bandSmoothed[i];
+      const diff = row.energy - prev;
+      const smoothed = prev + diff * (diff > 0 ? 0.5 : 0.08);
+      this.bandSmoothed[i] = smoothed;
+
+      if (smoothed >= this.bandPeaks[i]) {
+        this.bandPeaks[i] = smoothed;
+        this.bandPeakHold[i] = now + 900;
+      } else if (now > this.bandPeakHold[i]) {
+        this.bandPeaks[i] = Math.max(smoothed, this.bandPeaks[i] - 0.006);
+      }
+
+      const t = i / (rowCount - 1);
+      const c = t < 0.4 ? colors.accent : t < 0.75 ? colors.accent3 : colors.accent2;
+
+      if (showLabels) {
+        this._drawLeftColumn(ctx, { name: row.name, icon: row.icon }, y, rowHeight, colors, smoothed, row.label);
+      } else {
+        ctx.font = '400 9px "JetBrains Mono", monospace';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = `rgba(${colors.accent.r},${colors.accent.g},${colors.accent.b},0.55)`;
+        ctx.fillText(row.name, 4, y + rowHeight / 2);
+      }
+      this._drawSegmentedMeter(ctx, width, rightColW, y, rowHeight, smoothed, this.bandPeaks[i], colors, c, row.label);
+    }
+  }
+
+  reset() {
+    this.bandSmoothed.fill(0);
+    this.bandPeaks.fill(0);
+  }
+}
+
 
 /* ---------------- MODE: AUTO (picks + tunes a mode from the music itself) ---------------- */
 /* Delegates drawing to one of the other visualizer instances, choosing which
@@ -2424,7 +2715,9 @@ class AnimationEngine {
       orchestra1: new OrchestraModeV1(this.ctx, settings, theme),
       orchestra2: new OrchestraModeV2(this.ctx, settings, theme),
       meterbank: new MeterBankViz(this.ctx, settings, theme),
-      vitals: new VitalsGraph(this.ctx, settings, theme),
+      meterbank2: new MeterBankV2(this.ctx, settings, theme),
+      signalmeter: new SignalMeter(this.ctx, settings, theme),
+      spectrum2: new SpectrumBarsBlocks(this.ctx, settings, theme),
       waterfall: new SpectrogramViz(this.ctx, settings, theme),
       warp: new WarpViz(this.ctx, settings, theme),
       ripples: new RipplesViz(this.ctx, settings, theme),
@@ -2433,14 +2726,14 @@ class AnimationEngine {
     // Auto mode delegates to the modes above, so it's wired up after they
     // exist. It's deliberately excluded from modeOrder (the numbered 1-9
     // list) and addressed separately — see UIController, which gives it
-    // the "0" slot both on the toolbar and on the keyboard. Vitals ("V")
-    // and Meter Bank ("M") get their own letter slots the same way.
+    // the "0" slot both on the toolbar and on the keyboard. Meter Bank
+    // ("M") and its variants get their own letter slots the same way.
     this.modes.auto = new AutoViz(this.ctx, settings, theme);
     this.modes.auto.attach(this.modes, null, (key) => {
       if (this.onAutoModeChange) this.onAutoModeChange(key);
     });
 
-    this.modeOrder = ['spectrum', 'waveform1', 'waveform2', 'circular', 'linegraph1', 'linegraph2', 'particles', 'orchestra1', 'orchestra2', 'meterbank', 'vitals', 'waterfall', 'warp', 'ripples', 'scope', 'auto'];
+    this.modeOrder = ['spectrum', 'waveform1', 'waveform2', 'circular', 'linegraph1', 'linegraph2', 'particles', 'orchestra1', 'orchestra2', 'meterbank', 'meterbank2', 'signalmeter', 'waterfall', 'warp', 'ripples', 'scope', 'spectrum2', 'auto'];
     this.currentModeKey = 'spectrum';
 
     this.running = false;
@@ -2566,8 +2859,7 @@ class AnimationEngine {
 /* Per-visualization "looks best" combinations of sensitivity / gain /
    smoothing. Auto mode doesn't just switch which visualization is drawn —
    each one reads best with different input tuning (e.g. particles want a
-   punchy, low-smoothing response to transients; vitals wants a slow,
-   heavily smoothed trace; bars sit in between). Auto mode dials these in
+   punchy, low-smoothing response to transients; bars sit in between). Auto mode dials these in
    itself whenever it settles on a sub-mode, instead of leaving whatever
    the sliders happened to be at. */
 const AUTO_TUNE_PRESETS = {
@@ -2581,7 +2873,9 @@ const AUTO_TUNE_PRESETS = {
   orchestra1: { sensitivity: 1.15, gain: 1.10, smoothing: 0.70 },
   orchestra2: { sensitivity: 1.10, gain: 1.05, smoothing: 0.75 },
   meterbank: { sensitivity: 1.00, gain: 1.00, smoothing: 0.65 },
-  vitals: { sensitivity: 0.85, gain: 0.90, smoothing: 0.85 },
+  meterbank2: { sensitivity: 1.05, gain: 1.00, smoothing: 0.55 },
+  signalmeter: { sensitivity: 1.00, gain: 1.00, smoothing: 0.60 },
+  spectrum2: { sensitivity: 1.10, gain: 1.15, smoothing: 0.65 },
   waterfall: { sensitivity: 1.15, gain: 1.10, smoothing: 0.60 },
   warp: { sensitivity: 1.20, gain: 1.15, smoothing: 0.50 },
   ripples: { sensitivity: 1.25, gain: 1.15, smoothing: 0.60 },
@@ -2593,9 +2887,21 @@ const AUTO_TUNE_PRESETS = {
    want more headroom. */
 const AUTO_PEAK_TARGET = {
   spectrum: 0.90, circular: 0.85, particles: 0.80, orchestra1: 0.85,
-  orchestra2: 0.85, linegraph1: 0.80, linegraph2: 0.80, meterbank: 0.90,
-  waveform1: 0.70, waveform2: 0.70, vitals: 0.70,
+  orchestra2: 0.85, linegraph1: 0.80, linegraph2: 0.80, meterbank: 0.90, meterbank2: 0.92, signalmeter: 0.90, spectrum2: 0.90,
+  waveform1: 0.70, waveform2: 0.70,
   waterfall: 0.85, warp: 0.80, ripples: 0.85, scope: 0.70,
+};
+
+/* Modes demanding enough on the GPU/CPU to warn about: each does
+   meaningfully more per-frame work than the simpler bar/line modes (large
+   full-canvas pixel copies, hundreds of individually alpha-blended shapes,
+   or several overlapping blur/glow layers). */
+const HEAVY_MODES = {
+  particles: 'Draws hundreds of individually alpha-blended particles every frame.',
+  warp: 'Renders a large moving starfield with glow and a recomputed radial gradient every frame.',
+  waterfall: 'Copies and redraws a full-resolution scrolling image buffer every frame.',
+  ripples: 'Layers several overlapping blurred glow rings and gradients every frame.',
+  scope: 'Uses additive blending and glow across two full traces every frame.',
 };
 
 class UIController {
@@ -2615,6 +2921,7 @@ class UIController {
     this.recordedChunks = [];
     this.isRecording = false;
     this._autoTune = null;
+    this._perfWarnKey = null;
     this._autoKey = null;
     this._autoEnergy = 0;
     this._autoState = null;
@@ -2631,7 +2938,9 @@ class UIController {
       orchestra1: 'Orchestra Mode 1',
       orchestra2: 'Orchestra Mode 2',
       meterbank: 'Meter Bank',
-      vitals: 'Vitals Graph',
+      meterbank2: 'Meter Bank 2',
+      signalmeter: 'Signal Meter',
+      spectrum2: 'Spectrum Blocks',
       waterfall: 'Spectrogram',
       warp: 'Warp Tunnel',
       ripples: 'Beat Ripples',
@@ -2641,6 +2950,7 @@ class UIController {
 
     this._cacheDom();
     this._buildVizSelector();
+    this._bindPerfWarning();
     this._bindThemeSelect();
     this._bindToolbar();
     this._bindSettingsPanel();
@@ -2709,6 +3019,12 @@ class UIController {
       rngBarCount: document.getElementById('rngBarCount'),
       rngBandRows: document.getElementById('rngBandRows'),
       vBandRows: document.getElementById('vBandRows'),
+      perfWarnScrim: document.getElementById('perfWarnScrim'),
+      perfWarnDialog: document.getElementById('perfWarnDialog'),
+      perfWarnTitle: document.getElementById('perfWarnTitle'),
+      perfWarnBody: document.getElementById('perfWarnBody'),
+      chkPerfWarnDontShow: document.getElementById('chkPerfWarnDontShow'),
+      btnPerfWarnDismiss: document.getElementById('btnPerfWarnDismiss'),
       vBarCount: document.getElementById('vBarCount'),
       rngPeakHold: document.getElementById('rngPeakHold'),
       vPeakHold: document.getElementById('vPeakHold'),
@@ -2734,13 +3050,16 @@ class UIController {
   /* ---------------- VIZ MODE SELECTOR ---------------- */
   _buildVizSelector() {
     const order = this.engine.modeOrder;
-    // Regular modes are numbered 1-9 in order; Auto, Meter Bank and Vitals
-    // are addressed by letter/digit instead (0, M, V — matching their
-    // keyboard shortcuts) rather than continuing the numbering.
+    // Regular modes are numbered 1-9 in order; Auto and the Meter Bank /
+    // Spectrum / Scope variants are addressed by letter/digit instead
+    // (0, M, L, E, W, T, B, X — matching their keyboard shortcuts) rather
+    // than continuing the numbering.
     const lettered = {
       auto: { label: '0', cls: 'auto-btn', title: 'Keeps your current mode and auto-tunes sens / gain / smooth (0)' },
       meterbank: { label: 'M', cls: 'meterbank-btn' },
-      vitals: { label: 'V', cls: 'vitals-btn' },
+      meterbank2: { label: 'L', cls: 'meterbank-btn' },
+      signalmeter: { label: 'V', cls: 'meterbank-btn' },
+      spectrum2: { label: 'E', cls: 'extra-btn' },
       waterfall: { label: 'W', cls: 'extra-btn' },
       warp: { label: 'T', cls: 'extra-btn' },
       ripples: { label: 'B', cls: 'extra-btn' },
@@ -2767,6 +3086,7 @@ class UIController {
       this._autoTune = null;
       this._autoKey = null;
       this._lastManualMode = key;
+      this._maybeShowPerfWarning(key);
     } else {
       // Auto keeps the visualization you were on and only tunes its input.
       const auto = this.engine.modes.auto;
@@ -2775,6 +3095,7 @@ class UIController {
       this._autoKey = this._lastManualMode;
       this._autoEnergy = 0;
       this._autoState = null;
+      this._maybeShowPerfWarning(this._lastManualMode);
     }
     this.engine.setMode(key);
     this.el.modeChip.classList.remove('auto-live');
@@ -2782,6 +3103,45 @@ class UIController {
     [...this.el.vizSelect.children].forEach(b => {
       b.classList.toggle('active', b.dataset.mode === key);
     });
+  }
+
+  /* ---------------- PERFORMANCE WARNING ----------------
+     A small, theme-matched dialog that warns once per mode (persisted via
+     localStorage, best-effort) the first time the person switches into
+     something meaningfully heavier on the GPU/CPU than the simpler modes.
+     "Dismiss" with the checkbox checked (the default) remembers the choice
+     so it never nags again for that mode; unchecking it just closes the
+     dialog this one time. */
+  _bindPerfWarning() {
+    const close = () => {
+      this.el.perfWarnDialog.classList.remove('open');
+      this.el.perfWarnScrim.classList.remove('open');
+    };
+    const dismiss = () => {
+      if (this._perfWarnKey && this.el.chkPerfWarnDontShow.checked) {
+        try { localStorage.setItem(`resonix:perfWarnDismissed:${this._perfWarnKey}`, '1'); }
+        catch (e) { /* storage unavailable — just won't persist across reloads */ }
+      }
+      close();
+    };
+    this.el.btnPerfWarnDismiss.addEventListener('click', dismiss);
+    this.el.perfWarnScrim.addEventListener('click', dismiss);
+  }
+
+  _maybeShowPerfWarning(key) {
+    const reason = HEAVY_MODES[key];
+    if (!reason) return;
+    let dismissed = false;
+    try { dismissed = localStorage.getItem(`resonix:perfWarnDismissed:${key}`) === '1'; }
+    catch (e) { /* storage unavailable — fall through and warn anyway */ }
+    if (dismissed) return;
+
+    this._perfWarnKey = key;
+    this.el.perfWarnTitle.textContent = `${this.modeLabels[key]} is heavier on your GPU/CPU`;
+    this.el.perfWarnBody.textContent = reason;
+    this.el.chkPerfWarnDontShow.checked = true;
+    this.el.perfWarnDialog.classList.add('open');
+    this.el.perfWarnScrim.classList.add('open');
   }
 
   /* ---------------- AUTO MODE INPUT TUNING ----------------
@@ -3327,7 +3687,9 @@ class UIController {
         case '8': this._setMode('orchestra1'); break;
         case '9': this._setMode('orchestra2'); break;
         case 'm': this._setMode('meterbank'); break;
-        case 'v': this._setMode('vitals'); break;
+        case 'l': this._setMode('meterbank2'); break;
+        case 'v': this._setMode('signalmeter'); break;
+        case 'e': this._setMode('spectrum2'); break;
         case 'w': this._setMode('waterfall'); break;
         case 't': this._setMode('warp'); break;
         case 'b': this._setMode('ripples'); break;

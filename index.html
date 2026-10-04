@@ -15,7 +15,7 @@
 
 <link rel="stylesheet" href="style.css">
 </head>
-<body data-theme="phosphor">
+<body data-theme="deep-space">
 
   <!-- ===================== BACKGROUND GLOW LAYER ===================== -->
 
@@ -142,7 +142,7 @@
 
       <div class="toolbar-row toolbar-row-modes">
         <div class="toolbar-group viz-select" id="vizSelect">
-          <!-- populated by JS: 9 numbered mode buttons (1-9), Meter Bank (M), Vitals (V), Auto (0) -->
+          <!-- populated by JS: 9 numbered mode buttons (1-9), Meter Bank (M), Auto (0), plus lettered extras -->
         </div>
       </div>
 
@@ -252,7 +252,7 @@
           <span class="field-label">Row count — Orchestra 2 &amp; Line Graph 2 <em id="vBandRows">7</em></span>
           <input type="range" id="rngBandRows" min="7" max="40" step="1" value="7">
         </label>
-        <p class="field-hint">Above 7, rows switch from named bands (Bass, Mid…) to evenly-spaced frequency slices, so you can go well past the original 7 without needing a bigger FFT size.</p>
+        <p class="field-hint">Above 7, each of the 7 named bands (Sub Bass, Bass, Low Mid, Mid, High Mid, Presence, Brilliance) splits into numbered sub-rows — Bass 1, Bass 2, Bass 3… — instead of staying one row, with wider bands getting more sub-rows automatically. Meter Bank 2 doesn&rsquo;t use this slider: its Bass row is always split into 3 (Bass 1/2/3), with every other band staying as one row. Volume and Frequency live in their own mode — Signal Meter — instead.</p>
       </section>
 
       <section class="settings-section">
@@ -297,7 +297,7 @@
           <li><kbd>Space</kbd><span>Pause / Resume</span></li>
           <li><kbd>F</kbd><span>Fullscreen</span></li>
           <li><kbd>P</kbd><span>Picture-in-Picture (graph only)</span></li>
-          <li><kbd>1</kbd>–<kbd>9</kbd>, <kbd>M</kbd>, <kbd>V</kbd>, <kbd>0</kbd><span>Visualization mode (M = Meter Bank, V = Vitals, 0 = Auto)</span></li>
+          <li><kbd>1</kbd>–<kbd>9</kbd>, <kbd>M</kbd>, <kbd>L</kbd>, <kbd>V</kbd>, <kbd>E</kbd>, <kbd>0</kbd><span>Visualization mode (M = Meter Bank, L = Meter Bank 2, V = Signal Meter, E = Spectrum Blocks, 0 = Auto)</span></li>
           <li><kbd>W</kbd>, <kbd>T</kbd>, <kbd>B</kbd>, <kbd>X</kbd><span>Spectrogram, Warp Tunnel, Beat Ripples, XY Scope</span></li>
           <li><kbd>S</kbd><span>Screenshot</span></li>
           <li><kbd>R</kbd><span>Start / stop recording</span></li>
@@ -308,6 +308,21 @@
     </div>
   </aside>
   <div class="settings-scrim" id="settingsScrim"></div>
+
+  <!-- ===================== PERFORMANCE WARNING DIALOG ===================== -->
+  <div class="perf-warn-scrim" id="perfWarnScrim"></div>
+  <div class="perf-warn-dialog" id="perfWarnDialog" role="alertdialog" aria-modal="true" aria-labelledby="perfWarnTitle" aria-describedby="perfWarnBody">
+    <div class="perf-warn-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 3L2 20h20L12 3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 10v4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="17.3" r="1" fill="currentColor"/></svg>
+    </div>
+    <h3 id="perfWarnTitle">Heavier on your GPU/CPU</h3>
+    <p id="perfWarnBody">This mode is more demanding to render.</p>
+    <label class="field checkbox perf-warn-checkbox">
+      <input type="checkbox" id="chkPerfWarnDontShow" checked>
+      <span>Don't warn me for this mode again</span>
+    </label>
+    <button class="btn-primary perf-warn-dismiss" id="btnPerfWarnDismiss">Dismiss</button>
+  </div>
 
   <!-- Off-screen canvas for screenshot flash -->
   <a id="downloadLink" style="display:none"></a>
