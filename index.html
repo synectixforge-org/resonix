@@ -80,6 +80,9 @@
         <button class="icon-btn" id="btnPip" title="Picture-in-Picture (P)" aria-label="Toggle picture-in-picture — graph only">
           <svg viewBox="0 0 24 24" width="18" height="18"><rect x="3" y="5" width="18" height="14" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="12.5" y="11.5" width="7" height="5" rx="1" fill="currentColor"/></svg>
         </button>
+        <button class="icon-btn" id="btnLiteMode" title="Lite Mode — lower GPU/CPU/RAM use, fewer modes (Z)" aria-label="Toggle Lite Mode" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M11 2L4 13h5.2L8 22l9-13h-5.5L13 2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        </button>
       </div>
     </header>
 
@@ -108,6 +111,7 @@
 
       <!-- Mode label chip -->
       <div class="mode-chip" id="modeChip">Spectrum Bars</div>
+      <div class="lite-badge" id="liteBadge" hidden>LITE</div>
     </main>
 
     <!-- ---------- BOTTOM TOOLBAR ---------- -->
@@ -250,9 +254,53 @@
         </label>
         <label class="field">
           <span class="field-label">Row count — Orchestra 2 &amp; Line Graph 2 <em id="vBandRows">7</em></span>
-          <input type="range" id="rngBandRows" min="7" max="40" step="1" value="7">
+          <input type="range" id="rngBandRows" min="7" max="15" step="1" value="7">
         </label>
         <p class="field-hint">Above 7, each of the 7 named bands (Sub Bass, Bass, Low Mid, Mid, High Mid, Presence, Brilliance) splits into numbered sub-rows — Bass 1, Bass 2, Bass 3… — instead of staying one row, with wider bands getting more sub-rows automatically. Meter Bank 2 doesn&rsquo;t use this slider: its Bass row is always split into 3 (Bass 1/2/3), with every other band staying as one row. Volume and Frequency live in their own mode — Signal Meter — instead.</p>
+      </section>
+
+      <section class="settings-section">
+        <h3>Meter Bank 2 (L)</h3>
+        <label class="field">
+          <span class="field-label">Meter mode</span>
+          <select id="selMb2Mode">
+            <option value="spectrum">Spectrum Meter</option>
+            <option value="rms">RMS Meter</option>
+            <option value="peak">Peak Meter</option>
+            <option value="peakrms" selected>Peak + RMS (default)</option>
+            <option value="stereo">Stereo Meter</option>
+            <option value="precision">Precision</option>
+          </select>
+        </label>
+        <label class="field checkbox">
+          <input type="checkbox" id="chkMb2Ext">
+          <span>Use SENS / GAIN / SMOOTH sliders (off = calibrated)</span>
+        </label>
+        <label class="field">
+          <span class="field-label">Peak hold (ms) <em id="vMb2Hold">450</em></span>
+          <input type="range" id="rngMb2Hold" min="100" max="1500" step="50" value="450">
+        </label>
+        <label class="field">
+          <span class="field-label">Peak decay (dB/s) <em id="vMb2Fall">40</em></span>
+          <input type="range" id="rngMb2Fall" min="10" max="80" step="1" value="40">
+        </label>
+        <p class="field-hint">A calibrated meter: by default levels are true dBFS and the SENS / GAIN / SMOOTH sliders are ignored. Turn on the SENS/GAIN/SMOOTH button (or the checkbox above) to let them apply: SENS &times; GAIN offsets every level, SMOOTH slows or speeds the meter&rsquo;s response (neutral at the defaults 1.00 / 1.00 / 0.78). CLIP always reflects the real source signal. Band peaks are short-window band levels; the master peak is the true sample peak, and CLIP lights when a sample reaches full scale. Click CLIP (or press <kbd>C</kbd>) to clear the latch. You can also switch meter mode from the pills at the top of the meter.</p>
+      </section>
+
+      <section class="settings-section">
+        <h3>Orchestra Mode 2 (9)</h3>
+        <label class="field">
+          <span class="field-label">Visual style <em id="vOrchStyle">Flow</em></span>
+          <select id="selOrchStyle">
+            <option value="flow" selected>Orchestra — Flow</option>
+            <option value="aurora">Orchestra — Aurora</option>
+            <option value="particles">Orchestra — Particles</option>
+            <option value="field">Orchestra — Field</option>
+            <option value="minimal">Orchestra — Minimal</option>
+            <option value="reactive">Orchestra — Reactive</option>
+          </select>
+        </label>
+        <p class="field-hint">Flow is the enhanced default. Aurora turns the curves into luminous ribbons, Particles draws mostly with particle streams, Field pulls the bands toward a larger central energy field, Minimal is thin lines with very few particles (lowest GPU use), and Reactive turns up beats, trails and transient response. Quality also scales itself down automatically if frames get slow.</p>
       </section>
 
       <section class="settings-section">
@@ -297,8 +345,10 @@
           <li><kbd>Space</kbd><span>Pause / Resume</span></li>
           <li><kbd>F</kbd><span>Fullscreen</span></li>
           <li><kbd>P</kbd><span>Picture-in-Picture (graph only)</span></li>
+          <li><kbd>Z</kbd><span>Toggle Lite Mode (lower GPU/CPU/RAM, fewer modes)</span></li>
           <li><kbd>1</kbd>–<kbd>9</kbd>, <kbd>M</kbd>, <kbd>L</kbd>, <kbd>V</kbd>, <kbd>E</kbd>, <kbd>0</kbd><span>Visualization mode (M = Meter Bank, L = Meter Bank 2, V = Signal Meter, E = Spectrum Blocks, 0 = Auto)</span></li>
           <li><kbd>W</kbd>, <kbd>T</kbd>, <kbd>B</kbd>, <kbd>X</kbd><span>Spectrogram, Warp Tunnel, Beat Ripples, XY Scope</span></li>
+          <li><kbd>C</kbd><span>Clear the CLIP latch (Meter Bank 2)</span></li>
           <li><kbd>S</kbd><span>Screenshot</span></li>
           <li><kbd>R</kbd><span>Start / stop recording</span></li>
           <li><kbd>Esc</kbd><span>Exit fullscreen</span></li>

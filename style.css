@@ -373,6 +373,38 @@ button, select, input{ font-family: inherit; }
 }
 .mode-chip.auto-live{ color: var(--accent-3); border-color: color-mix(in srgb, var(--accent-3) 45%, var(--border)); }
 
+.lite-badge{
+  position: absolute;
+  top: 14px; right: 14px;
+  padding: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+/* ============================================================
+   LITE MODE
+   Applied to <body> while active. Cuts the one continuously-blurred,
+   GPU-filter-heavy decorative layer (.bg-glow — a 40px CSS blur
+   recomposited on every scroll/paint) and restricts the mode toolbar to
+   the handful of cheap-to-render visualizations (JS enforces the actual
+   mode switching; this just reflects it visually and dims the rest).
+   ============================================================ */
+body.lite-mode .bg-glow{ display: none; }
+body.lite-mode .bg-grid{ opacity: 0.5; }
+
+.viz-select.lite-active .viz-btn:not(.lite-allowed){
+  opacity: 0.3;
+  pointer-events: none;
+  filter: grayscale(0.6);
+}
+
 .beat-flash{
   position: absolute; inset: 0;
   background: radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 70%);

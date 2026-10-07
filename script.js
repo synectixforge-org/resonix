@@ -99,6 +99,26 @@ class AudioEngine {
     this.beatIntervals = [];
     this.bpm = 0;
     this.beatFlashCallback = null;
+    this.beatCount = 0;        // increments on every detected beat (visualizers diff it)
+    this.beatStrength = 0;     // 0.25-1, how far the last beat rose above the average
+
+    // Stereo analysis: the signal is also split into L/R and fed to two small
+    // analysers. They are only read while a mode asks for them (requestStereo).
+    this.splitter = null;
+    this.analyserL = null;
+    this.analyserR = null;
+    this.freqL = null; this.freqR = null;
+    this.timeL = null; this.timeR = null;
+    this._stereoUntil = 0;
+    this._lr = new Float32Array(2);
+
+    // Calibrated metering side-chain for Meter Bank 2 (built on demand)
+    this._mb = null;
+    this._meterUntil = 0;
+
+    // Spectral feature state
+    this.prevFreq = null;
+    this.logBin = null;
 
     // Output metrics (read by UI every frame)
     this.metrics = {
@@ -113,6 +133,10 @@ class AudioEngine {
       treble: 0,
       energy: 0,
       isSilent: true,
+      flux: 0,          // spectral flux (positive spectral change this frame)
+      fluxAvg: 0,       // slow average of flux, for relative transient detection
+      centroid: 0.4,    // spectral centroid, 0 (low) - 1 (bright), log-scaled
+      stereo: { l: 0, r: 0, balance: 0, width: 0.5, corr: 0.8, active: false },
     };
 
     this.latencyMs = 0;
@@ -182,6 +206,7 @@ class AudioEngine {
 
     this.sourceNode.connect(this.gainNode);
     this.gainNode.connect(this.analyser);
+    this._setupStereo();
     // Intentionally NOT connecting to audioCtx.destination:
     // we don't want to play the captured tab audio back out of the speakers
     // (that would create an echo since the tab is already playing audio).
@@ -210,6 +235,282 @@ class AudioEngine {
     this.freqData = new Uint8Array(binCount);
     this.freqDataF = new Float32Array(binCount);
     this.timeData = new Uint8Array(this.analyser.fftSize);
+    this.prevFreq = new Uint8Array(binCount);
+    this.logBin = new Float32Array(binCount);
+    for (let i = 0; i < binCount; i++) this.logBin[i] = Math.log2(Math.max(1, this.binToFreq(i)));
+  }
+
+  _setupStereo() {
+    try {
+      const ac = this.audioCtx;
+      this.splitter = ac.createChannelSplitter(2);
+      this.analyserL = ac.createAnalyser();
+      this.analyserR = ac.createAnalyser();
+      for (const a of [this.analyserL, this.analyserR]) {
+        a.fftSize = 1024;
+        a.smoothingTimeConstant = 0.5;
+        a.minDecibels = -100;
+        a.maxDecibels = -6;
+      }
+      this.gainNode.connect(this.splitter);
+      this.splitter.connect(this.analyserL, 0);
+      this.splitter.connect(this.analyserR, 1);
+      this.freqL = new Uint8Array(this.analyserL.frequencyBinCount);
+      this.freqR = new Uint8Array(this.analyserR.frequencyBinCount);
+      this.timeL = new Uint8Array(1024);
+      this.timeR = new Uint8Array(1024);
+    } catch (e) {
+      this._teardownStereo();
+    }
+  }
+
+  _teardownStereo() {
+    try { if (this.splitter) this.splitter.disconnect(); } catch (e) { /* noop */ }
+    try { if (this.analyserL) this.analyserL.disconnect(); } catch (e) { /* noop */ }
+    try { if (this.analyserR) this.analyserR.disconnect(); } catch (e) { /* noop */ }
+    this.splitter = this.analyserL = this.analyserR = null;
+    this.freqL = this.freqR = this.timeL = this.timeR = null;
+    this.metrics.stereo.active = false;
+  }
+
+  /** Modes that draw stereo information call this every frame; the L/R
+   *  analysers are only read while a request is fresh. */
+  requestStereo() { this._stereoUntil = performance.now() + 400; }
+
+  /* ---------------- PRECISION METERING (used by Meter Bank 2) ----------------
+     A calibrated side-chain tapped straight off the capture source — i.e.
+     BEFORE the GAIN slider — so every number is a real dBFS reading and clip
+     detection looks at the actual normalized sample values, not at whatever
+     the visual gain happens to be. It is built lazily the first time a mode
+     asks for it (requestMeters) and torn down again a couple of seconds after
+     the last request, so other modes never pay for it.
+
+       source -> stereo upmix -> splitter -> L/R x { 4096 FFT  (bands < 500 Hz, time data),
+                                                     1024 FFT  (bands >= 500 Hz),
+                                                     K-weighting (shelf + RLB high-pass) -> 2048 time data }
+
+     All analysers run with smoothingTimeConstant = 0, so the viz applies its
+     own (per-band) ballistics on top of raw, un-smoothed frames.
+     Conventions: band / RMS levels are "sine full-scale = 0 dB" (AES17-style),
+     peaks are true sample peaks, loudness is BS.1770 K-weighted (-0.691 offset). */
+  requestMeters() {
+    this._meterUntil = performance.now() + 600;
+    if (!this._mb && this.audioCtx && this.sourceNode) this._setupMeters();
+    return !!this._mb;
+  }
+
+  _setupMeters() {
+    try {
+      const ac = this.audioCtx;
+      const mk = (fft) => {
+        const a = ac.createAnalyser();
+        a.fftSize = fft;
+        a.smoothingTimeConstant = 0;
+        a.minDecibels = -120;
+        a.maxDecibels = 0;
+        return a;
+      };
+      const mb = {
+        input: ac.createGain(),
+        splitter: ac.createChannelSplitter(2),
+        loA: [mk(4096), mk(4096)],
+        hiA: [mk(1024), mk(1024)],
+        kA: [mk(2048), mk(2048)],
+        kNodes: [],
+        fLo: [new Float32Array(2048), new Float32Array(2048)],
+        fHi: [new Float32Array(512), new Float32Array(512)],
+        tLo: [new Float32Array(4096), new Float32Array(4096)],
+        tK: [new Float32Array(2048), new Float32Array(2048)],
+        bands: null, sr: 0,
+        use: null, b0: null, b1: null,
+        pow: null,                       // [band*2 + ch] mean-square amplitude (sine FS = 1)
+        peak: new Float32Array(2),       // true sample peak per channel (linear)
+        ms: new Float32Array(2),         // time-domain mean-square per channel
+        kms: 0,                          // K-weighted mean-square, L + R summed
+        clip: false,
+      };
+      // Mono sources get up-mixed to both channels instead of leaving R silent.
+      mb.input.channelCount = 2;
+      mb.input.channelCountMode = 'explicit';
+      mb.input.channelInterpretation = 'speakers';
+      mb.input.connect(mb.splitter);
+      for (let ch = 0; ch < 2; ch++) {
+        mb.splitter.connect(mb.loA[ch], ch);
+        mb.splitter.connect(mb.hiA[ch], ch);
+        const shelf = ac.createBiquadFilter();   // BS.1770 stage 1: head-related high shelf
+        shelf.type = 'highshelf';
+        shelf.frequency.value = 1681.97;
+        shelf.gain.value = 4.0;
+        const hp = ac.createBiquadFilter();      // BS.1770 stage 2: RLB high-pass
+        hp.type = 'highpass';
+        hp.frequency.value = 38.13;
+        hp.Q.value = -6.0;                       // Web Audio high-pass Q is in dB (0.5 linear)
+        mb.splitter.connect(shelf, ch);
+        shelf.connect(hp);
+        hp.connect(mb.kA[ch]);
+        mb.kNodes.push(shelf, hp);
+      }
+      this.sourceNode.connect(mb.input);
+      this._mb = mb;
+    } catch (e) {
+      this._teardownMeters();
+    }
+  }
+
+  _teardownMeters() {
+    const mb = this._mb;
+    this._mb = null;
+    if (!mb) return;
+    try { if (this.sourceNode) this.sourceNode.disconnect(mb.input); } catch (e) { /* noop */ }
+    const all = [mb.input, mb.splitter, ...mb.loA, ...mb.hiA, ...mb.kA, ...mb.kNodes];
+    for (const n of all) { try { n.disconnect(); } catch (e) { /* noop */ } }
+  }
+
+  /** Works out which FFT bins feed each band. Called again only when the band
+   *  list or sample rate changes. */
+  _prepareMeterBands(bands) {
+    const mb = this._mb, n = bands.length, sr = this.sampleRate;
+    mb.bands = bands;
+    mb.sr = sr;
+    mb.use = new Uint8Array(n);
+    mb.b0 = new Uint16Array(n);
+    mb.b1 = new Uint16Array(n);
+    mb.pow = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      const b = bands[i];
+      const useHi = b.lo >= 500 ? 1 : 0;
+      const N = useHi ? 1024 : 4096;
+      const binHz = sr / N;
+      const maxBin = N / 2 - 1;
+      let b0 = Math.ceil(b.lo / binHz);
+      let b1 = Math.ceil(b.hi / binHz) - 1;
+      if (b1 < b0) b0 = b1 = Math.round(((b.lo + b.hi) / 2) / binHz);
+      mb.use[i] = useHi;
+      mb.b0[i] = Util.clamp(b0, 1, maxBin);
+      mb.b1[i] = Util.clamp(b1, mb.b0[i], maxBin);
+    }
+  }
+
+  /** Reads one frame of calibrated measurements for `bands` (the Meter Bank 2
+   *  band list). Returns the shared meter state object (read it, don't keep
+   *  it), or null when nothing is being captured. */
+  updateMeters(bands, dtMs) {
+    if (!this.requestMeters()) return null;
+    const mb = this._mb;
+    if (mb.bands !== bands || mb.sr !== this.sampleRate) this._prepareMeterBands(bands);
+
+    // Blackman window: mean(w^2) = 0.3046. With the analyser's 1/N scaling,
+    // amplitude^2 of a band = 4 * (sum of bin powers) / 0.3046 (a full-scale
+    // sine therefore reads exactly 1.0 = 0 dB).
+    const K = 4 / 0.3046;
+    for (let ch = 0; ch < 2; ch++) {
+      mb.loA[ch].getFloatFrequencyData(mb.fLo[ch]);
+      mb.hiA[ch].getFloatFrequencyData(mb.fHi[ch]);
+      const fLo = mb.fLo[ch], fHi = mb.fHi[ch];
+      for (let i = 0; i < bands.length; i++) {
+        const f = mb.use[i] ? fHi : fLo;
+        let s = 0;
+        for (let k = mb.b0[i], e = mb.b1[i]; k <= e; k++) {
+          const d = f[k];
+          if (d > -130) s += Math.exp(d * 0.23025851);   // 10^(d/10)
+        }
+        mb.pow[i * 2 + ch] = s * K;
+      }
+    }
+
+    // Time domain: true sample peak over (at least) everything since the last
+    // frame, so a one-sample overload between frames can't slip past.
+    const scan = Util.clamp(Math.ceil(this.sampleRate * (dtMs / 1000) * 1.25), 256, 4096);
+    let pkMax = 0, kSum = 0;
+    for (let ch = 0; ch < 2; ch++) {
+      const t = mb.tLo[ch];
+      mb.loA[ch].getFloatTimeDomainData(t);
+      let pk = 0, ss = 0;
+      for (let i = t.length - scan; i < t.length; i++) { const v = t[i]; const a = v < 0 ? -v : v; if (a > pk) pk = a; }
+      for (let i = t.length - 2048; i < t.length; i++) ss += t[i] * t[i];
+      mb.peak[ch] = pk;
+      mb.ms[ch] = ss / 2048;
+      if (pk > pkMax) pkMax = pk;
+
+      const tk = mb.tK[ch];
+      mb.kA[ch].getFloatTimeDomainData(tk);
+      let ks = 0;
+      for (let i = 0; i < tk.length; i++) ks += tk[i] * tk[i];
+      kSum += ks / tk.length;
+    }
+    mb.kms = kSum;
+    mb.clip = pkMax >= 0.999;
+    return mb;
+  }
+
+  /** Averaged L/R energy (0-1 each) for a Hz range. Returns a shared 2-slot
+   *  array [left, right] — copy values out, don't hold on to it. */
+  getBandLR(loHz, hiHz) {
+    const out = this._lr;
+    out[0] = 0; out[1] = 0;
+    if (!this.freqL || !this.sampleRate) return out;
+    const bins = this.freqL.length;
+    const lo = Util.clamp(Math.round(loHz * 1024 / this.sampleRate), 0, bins - 1);
+    const hi = Util.clamp(Math.round(hiHz * 1024 / this.sampleRate), lo, bins - 1);
+    let l = 0, r = 0;
+    for (let i = lo; i <= hi; i++) { l += this.freqL[i]; r += this.freqR[i]; }
+    const cnt = hi - lo + 1;
+    out[0] = l / cnt / 255;
+    out[1] = r / cnt / 255;
+    return out;
+  }
+
+  _computeStereo() {
+    const a = this.analyserL, b = this.analyserR;
+    if (!a || !b) return;
+    a.getByteTimeDomainData(this.timeL);
+    b.getByteTimeDomainData(this.timeR);
+    a.getByteFrequencyData(this.freqL);
+    b.getByteFrequencyData(this.freqR);
+    const L = this.timeL, R = this.timeR, n = L.length;
+    let ll = 0, rr = 0, lr = 0, mm = 0, ss = 0;
+    for (let i = 0; i < n; i++) {
+      const l = (L[i] - 128) / 128, r = (R[i] - 128) / 128;
+      ll += l * l; rr += r * r; lr += l * r;
+      const mid = (l + r) * 0.5, side = (l - r) * 0.5;
+      mm += mid * mid; ss += side * side;
+    }
+    const rmsL = Math.sqrt(ll / n), rmsR = Math.sqrt(rr / n);
+    const e = ll * rr;
+    const corr = e > 1e-9 ? lr / Math.sqrt(e) : 1;
+    const tot = mm + ss;
+    const width = tot > 1e-9 ? Util.clamp(Math.sqrt(ss / tot) * 1.6, 0, 1) : 0;
+    const bal = (rmsR - rmsL) / (rmsR + rmsL + 1e-4);
+    const s = this.metrics.stereo, k = 0.25;
+    s.l = rmsL; s.r = rmsR;
+    s.balance += (bal - s.balance) * k;
+    s.width += (width - s.width) * k;
+    s.corr += (corr - s.corr) * k;
+    s.active = true;
+  }
+
+  /** Spectral flux + centroid, computed from the same FFT frame as everything else. */
+  _computeFeatures() {
+    const f = this.freqData, prev = this.prevFreq, lb = this.logBin;
+    if (!f || !prev || !lb || prev.length !== f.length) return;
+    const n = f.length;
+    let pos = 0, wsum = 0, tot = 0;
+    for (let i = 1; i < n; i++) {
+      const v = f[i];
+      const d = v - prev[i];
+      if (d > 0) pos += d;
+      prev[i] = v;
+      tot += v;
+      wsum += v * lb[i];
+    }
+    const m = this.metrics;
+    const fl = Math.min(4, (pos / (n * 255)) * 40);
+    m.flux = fl;
+    m.fluxAvg += (fl - m.fluxAvg) * 0.04;
+    if (tot > 40) {
+      const norm = (wsum / tot - 5.3) / (13.8 - 5.3); // ~40 Hz .. ~14 kHz, log
+      m.centroid += (Util.clamp(norm, 0, 1) - m.centroid) * 0.12;
+    }
   }
 
   setFftSize(size) {
@@ -255,6 +556,8 @@ class AudioEngine {
       if (this.gainNode) this.gainNode.disconnect();
       if (this.analyser) this.analyser.disconnect();
     } catch (e) { /* noop */ }
+    this._teardownMeters();
+    this._teardownStereo();
     try {
       if (this.audioCtx) this.audioCtx.close();
     } catch (e) { /* noop */ }
@@ -276,6 +579,9 @@ class AudioEngine {
     this.analyser.getFloatFrequencyData(this.freqDataF);
     this.analyser.getByteTimeDomainData(this.timeData);
     this._computeMetrics();
+    this._computeFeatures();
+    if (this.analyserL && performance.now() < this._stereoUntil) this._computeStereo();
+    if (this._mb && performance.now() > this._meterUntil + 2500) this._teardownMeters();
     this._detectBeat();
   }
 
@@ -439,6 +745,8 @@ class AudioEngine {
         }
       }
       this.lastBeatTime = now;
+      this.beatCount++;
+      this.beatStrength = Util.clamp((energy / Math.max(avg, 0.02) - 1) / 0.9, 0.25, 1);
       if (this.beatFlashCallback) this.beatFlashCallback(energy);
     }
   }
@@ -574,9 +882,14 @@ class SettingsManager {
       peakHoldTime: 900,
       waveThickness: 2,
       moreLines: false, // Line Graph modes 1 & 2: classic 3-band vs full 7-band detail
-      bandRows: 7, // Row count for Orchestra Mode 2 & Line Graph 2 (7 = named bands, 8-40 = log-spaced slices)
+      orchestraStyle: 'flow', // Orchestra Mode 2 rendering style
+      bandRows: 7, // Row count for Orchestra Mode 2 & Line Graph 2 (7 = named bands, 8-15 = log-spaced slices)
       targetFps: 0, // 0 = unlimited (draw every rAF tick); otherwise caps the render loop
       latencyHint: 'interactive', // AudioContext latencyHint — applied on next capture start
+      mb2Mode: 'peakrms', // Meter Bank 2: spectrum | rms | peak | peakrms | stereo | precision
+      mb2PeakHold: 450, // Meter Bank 2: ms a peak marker stays put before it starts to fall
+      mb2PeakFall: 40, // Meter Bank 2: peak marker fall rate once released (dB per second)
+      mb2ExtCtrl: false, // Meter Bank 2: false = calibrated (ignores SENS/GAIN/SMOOTH), true = sliders apply
     };
     this.listeners = {};
   }
@@ -1362,7 +1675,7 @@ class LineGraphV2 extends Visualizer {
     this._ensureRows(3);
   }
 
-  // Row count follows settings.bandRows once "more lines" is on (7-40); the
+  // Row count follows settings.bandRows once "more lines" is on (7-15); the
   // classic 3-band view always uses exactly 3. Reallocated only when the
   // count actually changes.
   _ensureRows(count) {
@@ -1376,7 +1689,7 @@ class LineGraphV2 extends Visualizer {
     const { width, height } = this;
     const colors = this.theme.getAccentColors();
     const moreLines = this.settings.get('moreLines');
-    const rowCountSetting = Util.clamp(Math.round(this.settings.get('bandRows') || 7), 7, 40);
+    const rowCountSetting = Util.clamp(Math.round(this.settings.get('bandRows') || 7), 7, 15);
     const bands = moreLines
       ? (rowCountSetting === 7 ? audio.bandDefs : audio.getDynamicBands(rowCountSetting))
       : LineGraphV2.CLASSIC_BANDS;
@@ -1488,28 +1801,76 @@ class LineGraphV2 extends Visualizer {
   }
 }
 
-/* ---------------- MODE 5: PARTICLE VISUALIZER ---------------- */
+/* ---------------- MODE 5: PARTICLE VISUALIZER (Spectral Fireflies) ----------------
+   Full redesign — the old version was just uniform drifting dots nudged by
+   three blended band scalars (bass/mid/treble), so nothing about where a
+   particle was or what it looked like actually corresponded to anything in
+   the music. Now:
+    - Every particle is assigned a point along the log-scaled spectrum and
+      samples that exact frequency bin every frame, so its size/brightness
+      directly reflects that part of the mix, not a generic blend.
+    - Color follows the same assignment (low = accent, mid = accent3, high
+      = accent2), the same idea the Spectrogram mode uses, so color has
+      meaning instead of being random per particle.
+    - Ambient particles drift upward like embers and fade in/out over their
+      lifetime instead of just wrapping at the edges forever.
+    - Real bass onsets (not just "bass is loud", an actual transient —
+      same onset test Beat Ripples uses) trigger a radial burst of fresh,
+      faster, brighter particles from the center, so the mode visibly
+      reacts to hits instead of just ambiently shimmering. */
 class ParticleViz extends Visualizer {
   constructor(ctx, settings, theme) {
     super(ctx, settings, theme);
     this.particles = [];
+    this.avgBass = 0;
+    this.lastBurst = 0;
+  }
+
+  /** freqT (0-1): where this particle sits along the spectrum (biased low
+   *  for burst particles, since they're born from a bass hit). */
+  _spawn(freqT, isBurst) {
+    if (isBurst) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 1 + Math.random() * 2.6;
+      return {
+        x: this.width / 2, y: this.height * 0.55,
+        vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+        freqT, isBurst: true,
+        age: 0, maxAge: 600 + Math.random() * 500,
+        size: 1.4 + Math.random() * 2.2,
+      };
+    }
+    return {
+      x: Math.random() * this.width, y: this.height + 10 + Math.random() * 30,
+      vx: (Math.random() - 0.5) * 0.12, vy: -(0.22 + Math.random() * 0.4),
+      freqT, isBurst: false,
+      age: 0, maxAge: 4000 + Math.random() * 3500,
+      size: 1 + Math.random() * 1.7,
+      wobble: Math.random() * Math.PI * 2,
+    };
   }
 
   _ensure(count) {
-    while (this.particles.length < count) {
-      this.particles.push(this._spawn());
-    }
-    if (this.particles.length > count) this.particles.length = count;
+    while (this.particles.length < count) this.particles.push(this._spawn(Math.random(), false));
   }
 
-  _spawn() {
+  /** Low = accent, mid = accent3, high = accent2 — same register-to-color
+   *  idea as the Spectrogram mode, so a particle's color tells you roughly
+   *  what part of the mix it's showing. */
+  _colorFor(freqT, colors) {
+    if (freqT < 0.5) {
+      const t = freqT * 2;
+      return {
+        r: Util.lerp(colors.accent.r, colors.accent3.r, t),
+        g: Util.lerp(colors.accent.g, colors.accent3.g, t),
+        b: Util.lerp(colors.accent.b, colors.accent3.b, t),
+      };
+    }
+    const t = (freqT - 0.5) * 2;
     return {
-      x: Math.random() * this.width,
-      y: Math.random() * this.height,
-      vx: (Math.random() - 0.5) * 0.4,
-      vy: (Math.random() - 0.5) * 0.4,
-      baseSize: 0.8 + Math.random() * 1.6,
-      hueT: Math.random(),
+      r: Util.lerp(colors.accent3.r, colors.accent2.r, t),
+      g: Util.lerp(colors.accent3.g, colors.accent2.g, t),
+      b: Util.lerp(colors.accent3.b, colors.accent2.b, t),
     };
   }
 
@@ -1520,53 +1881,100 @@ class ParticleViz extends Visualizer {
     const colors = this.theme.getAccentColors();
     this._ensure(count);
 
-    // Trail effect via low-alpha overpaint (motion blur). Note: this canvas is
-    // created with {alpha:false}, so 'destination-out' compositing has no
-    // alpha channel to act on — a plain semi-transparent fill fades old
-    // pixels toward black instead, which reads the same visually.
-    ctx.fillStyle = 'rgba(0,0,0,0.18)';
-    ctx.fillRect(0, 0, width, height);
+    // Live state only: wipe the previous frame completely (no motion-blur
+    // overpaint), so nothing from earlier frames lingers on screen.
+    ctx.clearRect(0, 0, width, height);
 
-    const bass = audio.metrics.bass, mid = audio.metrics.mid, treble = audio.metrics.treble;
-    const speedMul = 1 + treble * 3;
-    const sizeMul = 1 + bass * 2.6;
+    const m = audio.metrics;
+    this.avgBass = Util.lerp(this.avgBass, m.bass, 0.05);
+    const onset = m.bass > this.avgBass * 1.4 && m.bass > 0.26 && now - this.lastBurst > 160;
+    if (onset) {
+      this.lastBurst = now;
+      const burstCount = Math.round(10 + m.bass * 34);
+      for (let i = 0; i < burstCount; i++) this.particles.push(this._spawn(Math.random() * 0.35, true));
+      const cap = Math.round(count * 1.6);
+      if (this.particles.length > cap) this.particles.splice(0, this.particles.length - cap);
+    }
+
+    const freq = audio.freqData, binCount = freq.length;
+    const burstPts = []; // collected this frame, for the constellation lines below
+    const next = [];
 
     for (const p of this.particles) {
-      p.x += p.vx * speedMul * (dt * 0.06);
-      p.y += p.vy * speedMul * (dt * 0.06);
+      p.age += dt;
+      const lifeT = p.age / p.maxAge;
+      if (lifeT >= 1) {
+        if (!p.isBurst) next.push(this._spawn(Math.random(), false)); // ambient density stays constant
+        continue;
+      }
 
-      if (p.x < 0) p.x += width;
-      if (p.x > width) p.x -= width;
-      if (p.y < 0) p.y += height;
-      if (p.y > height) p.y -= height;
+      if (p.isBurst) {
+        p.vx *= 0.985; p.vy *= 0.985;
+        p.vy += dt * 0.0011; // gentle gravity pulls the burst back down
+      } else {
+        p.wobble += dt * 0.0015;
+        p.x += Math.sin(p.wobble) * 0.15;
+      }
+      p.x += p.vx * dt * 0.06;
+      p.y += p.vy * dt * 0.06;
 
-      const size = p.baseSize * sizeMul;
-      const r = Util.lerp(colors.accent.r, colors.accent3.r, Util.lerp(p.hueT, mid, 0.5));
-      const g = Util.lerp(colors.accent.g, colors.accent3.g, Util.lerp(p.hueT, mid, 0.5));
-      const b = Util.lerp(colors.accent.b, colors.accent3.b, Util.lerp(p.hueT, mid, 0.5));
+      if (p.x < -10) p.x = width + 10;
+      if (p.x > width + 10) p.x = -10;
+      if (!p.isBurst && p.y < -10) { next.push(this._spawn(Math.random(), false)); continue; }
 
-      ctx.fillStyle = `rgba(${r},${g},${b},${0.55 + bass * 0.4})`;
+      const bin = Math.min(binCount - 1, Math.floor(Math.pow(p.freqT, 1.7) * binCount));
+      const e = Util.clamp((freq[bin] / 255) * audio.sensitivity, 0, 1);
+
+      const fade = p.isBurst
+        ? (1 - lifeT)
+        : Math.min(1, lifeT * 6) * Math.min(1, (1 - lifeT) * 2.5); // fade in, hold, fade out
+      const alpha = p.isBurst ? (0.5 + e * 0.5) * fade : (0.2 + e * 0.75) * fade;
+      const size = p.size * (p.isBurst ? (1 + e * 1.3) : (0.6 + e * 1.8));
+      const c = this._colorFor(p.freqT, colors);
+
+      if (p.isBurst) {
+        // Cheap halo (a second, larger, fainter fill) instead of shadowBlur —
+        // true glow on hundreds of particles would be the single biggest
+        // cost in this mode; reserving it for the much smaller burst set
+        // keeps the hit-impact without the frame-rate tax.
+        ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},${alpha * 0.25})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, size * 2.4, 0, Math.PI * 2);
+        ctx.fill();
+        burstPts.push(p);
+      }
+
+      ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},${alpha})`;
       ctx.beginPath();
       ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
       ctx.fill();
-    }
 
-    // Occasional connecting lines on strong beats for cohesion (cheap O(n) sampled pairs)
-    if (bass > 0.45) {
-      ctx.strokeStyle = `rgba(${colors.accent2.r},${colors.accent2.g},${colors.accent2.b},${0.12 * bass})`;
+      next.push(p);
+    }
+    this.particles = next;
+
+    // Constellation lines between nearby burst particles only — a bounded,
+    // small set, so this stays cheap even though it's an O(n^2)-shaped scan.
+    if (burstPts.length > 1) {
+      ctx.strokeStyle = `rgba(${colors.accent2.r},${colors.accent2.g},${colors.accent2.b},0.2)`;
       ctx.lineWidth = 1;
       ctx.beginPath();
-      for (let i = 0; i < this.particles.length; i += 9) {
-        const a = this.particles[i];
-        const b2 = this.particles[(i + 9) % this.particles.length];
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b2.x, b2.y);
+      const maxDist = Math.min(width, height) * 0.14;
+      for (let i = 0; i < burstPts.length; i++) {
+        for (let j = i + 1; j < burstPts.length; j++) {
+          const a = burstPts[i], b = burstPts[j];
+          const dx = a.x - b.x, dy = a.y - b.y;
+          if (dx * dx + dy * dy < maxDist * maxDist) {
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+          }
+        }
       }
       ctx.stroke();
     }
   }
 
-  reset() { this.particles = []; }
+  reset() { this.particles = []; this.avgBass = 0; }
 }
 
 /* ---------------- MODE 6: ORCHESTRA MODE (multi-band meter bank) ---------------- */
@@ -1871,66 +2279,346 @@ class OrchestraModeV1 extends OrchestraBase {
   }
 }
 
-/* ---------------- MODE 7: ORCHESTRA MODE 2 (static, anchored in place) ---------------- */
+/* ---------------- MODE 7: ORCHESTRA MODE 2 (one living, interconnected system) ----------------
+   Same rows, labels, Hz ranges and meter column as before — but the rows are
+   no longer six independent graphs:
+
+   Audio features -> per-band attack/release -> visual physics -> canvas
+
+   - Each band family has its own look AND its own temporal response
+     (Bass: slow, heavy, thick  ...  Brilliance: instant, hair-thin, sparkling).
+   - Rows are coupled: neighbours bleed into each other, bass sends a slow
+     upward wave through the stack, beats launch a shockwave from the
+     foundation row through every band, and when many bands are active at
+     once they pull into one shared arch (the "formation").
+   - A central energy field sits behind the stack and follows loudness, bass,
+     beats, stereo width/correlation and the spectral centroid.
+   - Stereo: per-band L/R balance tilts each curve, stereo width spreads the
+     energy across the row (mono collapses toward the centre), and particles
+     drift to the side they came from.
+   - Particles live in one pooled struct-of-arrays (no per-frame allocation),
+     are drawn in batched additive passes, and inherit motion from the curves.
+   - Quality adapts to frame time: particles thin out on slow devices
+     and come back when there is headroom.
+
+   Rendering stays on the 2D canvas the rest of the app (PiP, screenshots,
+   recording) is built on, with pooled buffers and batched draws. */
+const ORCH2_CAT = { sub: 0, bass: 1, lowmid: 2, mid: 3, highmid: 4, presence: 5, brilliance: 6 };
+// Per-60fps-frame attack / release coefficients, slow -> instant by band family.
+const ORCH2_ATK = [0.16, 0.20, 0.27, 0.40, 0.55, 0.75, 0.93];
+const ORCH2_REL = [0.040, 0.050, 0.075, 0.130, 0.220, 0.380, 0.620];
+// How long a per-band transient "ping" lingers (per-60fps-frame retention).
+const ORCH2_TRANS_KEEP = [0.93, 0.92, 0.90, 0.88, 0.84, 0.80, 0.74];
+const ORCH2_TAU = Math.PI * 2;
+
+const ORCH2_STYLES = {
+  flow: { fill: 1.00, parts: 1.0, core: 1.0, react: 1.0, pts: 48, additive: true },
+  aurora: { fill: 0.90, parts: 0.35, core: 0.85, react: 1.0, pts: 56, additive: true, aurora: true },
+  particles: { fill: 0.12, parts: 2.6, core: 0.9, react: 1.1, pts: 48, additive: true, stream: true },
+  field: { fill: 0.95, parts: 0.7, core: 2.1, react: 1.0, pts: 48, additive: true, field: true },
+  minimal: { fill: 0.10, parts: 0.18, core: 0.4, react: 0.8, pts: 28, additive: false, minimal: true },
+  reactive: { fill: 1.05, parts: 1.8, core: 1.5, react: 1.7, pts: 48, additive: true },
+};
+
+// dt-independent version of a "per 60fps frame" smoothing coefficient.
+function orchK(k60, dN) { return 1 - Math.pow(1 - k60, dN); }
+
 class OrchestraModeV2 extends OrchestraBase {
   constructor(ctx, settings, theme) {
     super(ctx, settings, theme);
-    this.pointsPerRow = 36;
-    this.rowCount = 0; // forces _ensureRows to allocate on first draw
+    this.MAXPTS = 64;
+    this.PCAP = 1100;
+    this.SH = 6;   // simultaneous shockwaves
+    this.RN = 3;   // simultaneous core rings
+
+    // Reused scratch buffers (never reallocated per frame)
+    this._xs = new Float32Array(this.MAXPTS);
+    this._ya = new Float32Array(this.MAXPTS);
+    this._yb = new Float32Array(this.MAXPTS);
+    this._yc = new Float32Array(this.MAXPTS);
+    this._yd = new Float32Array(this.MAXPTS);
+    this._tmp = new Float32Array(this.MAXPTS);
+    this._bell = new Float32Array(this.MAXPTS);
+    this._dash = [3, 3];
+
+    // Particle pool (struct of arrays)
+    const P = this.PCAP;
+    this.pX = new Float32Array(P); this.pY = new Float32Array(P);
+    this.pVX = new Float32Array(P); this.pVY = new Float32Array(P);
+    this.pLife = new Float32Array(P); this.pMax = new Float32Array(P);
+    this.pSize = new Float32Array(P); this.pPh = new Float32Array(P);
+    this.pCol = new Uint8Array(P); this.pKind = new Uint8Array(P); this.pKey = new Uint8Array(P);
+    this.pCursor = 0;
+    this._pCap = 300;
+
+    this.shPos = new Float32Array(this.SH);
+    this.shStr = new Float32Array(this.SH);
+    this.ringR = new Float32Array(this.RN);
+    this.ringA = new Float32Array(this.RN);
+
+    this._f = {}; // per-frame context, filled in draw()
+    this._bands = null;
+    this._bandsKey = 0;
+    this.rowCount = 0;
+    this._resetGlobals();
     this._ensureRows(7);
   }
 
-  // Row count is user-adjustable (7-40, see settings.bandRows), so the
-  // per-row state arrays are reallocated (preserving whatever fits) whenever
-  // it changes, rather than being fixed at 7 the way they used to be.
-  _ensureRows(rowCount) {
-    if (rowCount === this.rowCount) return;
-    this.rowCount = rowCount;
-    this.bandSmoothed = new Float32Array(rowCount);
-    this.bandPeaks = new Float32Array(rowCount);
-    this.bandPeakHold = new Float32Array(rowCount);
-    this.rowSamples = Array.from({ length: rowCount }, () => new Float32Array(this.pointsPerRow));
-    // Slower-decaying envelope per row — an overlaid "ceiling" line that
-    // traces the recent local maxima above the live silhouette.
-    this.rowEnvelope = Array.from({ length: rowCount }, () => new Float32Array(this.pointsPerRow));
-    // Slow-rising "floor" that traces recent local minima below the live
-    // silhouette — a third independent variable per point, alongside the
-    // silhouette and the ceiling.
-    this.rowFloor = Array.from({ length: rowCount }, () => new Float32Array(this.pointsPerRow));
+  _resetGlobals() {
+    this.loud = 0; this.bassE = 0; this.midE = 0; this.trebE = 0; this.fluxEnv = 0;
+    this.kick = 0; this.kickT = 0; this.flash = 0; this.flashT = 0;
+    this.coreE = 0; this.corePulse = 0; this.corePulseT = 0;
+    this.stWidth = 0.5; this.corr = 0.8; this.centroid = 0.4; this.form = 0;
+    this.qual = 1; this.qualT = 0; this.dtAvg = 16.7;
+    this._beatSeen = -1; this._pendingBeat = 0;
+    this._lastN = 0;
+    this.shStr.fill(0); this.ringA.fill(0); this.pLife.fill(0); this.pCursor = 0;
   }
 
-  draw(audio, now) {
+  _ensureRows(rc) {
+    if (rc === this.rowCount) return;
+    this.rowCount = rc;
+    const M = this.MAXPTS;
+    const mk = () => new Float32Array(rc);
+    this.bandSmoothed = mk(); this.bandPeaks = mk(); this.bandPeakHold = mk();
+    this.rowFast = mk(); this.rowSlow = mk(); this.rowTrans = mk();
+    this.rowBal = mk(); this.rowShock = mk(); this.rowCool = mk(); this.rowBurst = mk();
+    this.emitAcc = mk();
+    this.rowCat = new Uint8Array(rc);
+    const grid = () => Array.from({ length: rc }, () => new Float32Array(M));
+    this.samples = grid(); this.disp = grid(); this.prevDisp = grid(); this.envelope = grid();
+  }
+
+  resize(w, h, dpr) {
+    super.resize(w, h, dpr);
+    this.pLife.fill(0);
+  }
+
+  _buildBell(n) {
+    for (let p = 0; p < n; p++) {
+      const u = p / (n - 1) - 0.5;
+      this._bell[p] = 0.55 + 0.45 * Math.exp(-(u * u) / 0.07);
+    }
+  }
+
+  /* ---------- small drawing helpers (typed-array curves, no object churn) ---------- */
+  _rgba(c, a) {
+    return `rgba(${c.r | 0},${c.g | 0},${c.b | 0},${a < 0 ? 0 : a > 1 ? 1 : +a.toFixed(3)})`;
+  }
+  _mixRgba(c1, c2, t, a) {
+    return `rgba(${(c1.r + (c2.r - c1.r) * t) | 0},${(c1.g + (c2.g - c1.g) * t) | 0},${(c1.b + (c2.b - c1.b) * t) | 0},${a < 0 ? 0 : a > 1 ? 1 : +a.toFixed(3)})`;
+  }
+  _a(a) { const v = a * this._f.bright; return v > 1 ? 1 : v; }
+
+  _curveTo(ctx, xs, ys, n) {
+    for (let i = 1; i < n - 1; i++) {
+      ctx.quadraticCurveTo(xs[i], ys[i], (xs[i] + xs[i + 1]) * 0.5, (ys[i] + ys[i + 1]) * 0.5);
+    }
+    ctx.lineTo(xs[n - 1], ys[n - 1]);
+  }
+  _curveRev(ctx, xs, ys, n) {
+    for (let k = n - 2; k >= 1; k--) {
+      ctx.quadraticCurveTo(xs[k], ys[k], (xs[k] + xs[k - 1]) * 0.5, (ys[k] + ys[k - 1]) * 0.5);
+    }
+    ctx.lineTo(xs[0], ys[0]);
+  }
+  _linePath(ctx, xs, ys, n) {
+    ctx.beginPath();
+    ctx.moveTo(xs[0], ys[0]);
+    this._curveTo(ctx, xs, ys, n);
+  }
+  _fillPath(ctx, xs, ys, n, baseY) {
+    ctx.beginPath();
+    ctx.moveTo(xs[0], baseY);
+    ctx.lineTo(xs[0], ys[0]);
+    this._curveTo(ctx, xs, ys, n);
+    ctx.lineTo(xs[n - 1], baseY);
+    ctx.closePath();
+  }
+  _bandPath(ctx, xs, top, bot, n) {
+    ctx.beginPath();
+    ctx.moveTo(xs[0], top[0]);
+    this._curveTo(ctx, xs, top, n);
+    ctx.lineTo(xs[n - 1], bot[n - 1]);
+    this._curveRev(ctx, xs, bot, n);
+    ctx.closePath();
+  }
+  _blur(a, n, passes) {
+    const t = this._tmp;
+    for (let k = 0; k < passes; k++) {
+      t[0] = a[0]; t[n - 1] = a[n - 1];
+      for (let p = 1; p < n - 1; p++) t[p] = a[p - 1] * 0.25 + a[p] * 0.5 + a[p + 1] * 0.25;
+      for (let p = 0; p < n; p++) a[p] = t[p];
+    }
+  }
+  // out[p] = baseY - interp(D, p + shift) * scale * H
+  _shifted(D, n, shift, scale, baseY, H, out) {
+    for (let p = 0; p < n; p++) {
+      let f = p + shift;
+      f = f < 0 ? 0 : f > n - 1 ? n - 1 : f;
+      const i0 = f | 0, i1 = i0 + 1 < n ? i0 + 1 : i0, t = f - i0;
+      out[p] = baseY - (D[i0] * (1 - t) + D[i1] * t) * scale * H;
+    }
+  }
+
+  /* ---------- events ---------- */
+  _startShock(pos, str) {
+    let slot = 0, weakest = 1e9;
+    for (let s = 0; s < this.SH; s++) {
+      if (this.shStr[s] <= 0.02) { slot = s; weakest = -1; break; }
+      if (this.shStr[s] < weakest) { weakest = this.shStr[s]; slot = s; }
+    }
+    this.shPos[slot] = pos;
+    this.shStr[slot] = Math.min(1.4, str);
+  }
+
+  _spawn(x, y, vx, vy, life, size, col, kind) {
+    const idx = this.pCursor;
+    this.pCursor = (idx + 1) % this._pCap;
+    this.pX[idx] = x; this.pY[idx] = y; this.pVX[idx] = vx; this.pVY[idx] = vy;
+    this.pLife[idx] = life; this.pMax[idx] = life; this.pSize[idx] = size;
+    this.pPh[idx] = Math.random() * ORCH2_TAU;
+    this.pCol[idx] = col; this.pKind[idx] = kind;
+  }
+
+  _onBeat(str) {
+    const f = this._f, st = f.st;
+    const s = Util.clamp(0.35 + str * 0.65, 0.35, 1);
+    this.kickT = Math.max(this.kickT, s);
+    this.corePulseT = Math.max(this.corePulseT, 0.55 + 0.45 * s);
+    this.flashT = Math.max(this.flashT, s);
+    this._startShock(-0.8, s * st.react);
+    for (let k = 0; k < this.RN; k++) {
+      if (this.ringA[k] < 0.02) { this.ringR[k] = f.coreR * 0.3; this.ringA[k] = 0.6 * s; break; }
+    }
+    const cnt = Math.round((8 + 20 * s) * st.parts * this.qual);
+    for (let q = 0; q < cnt; q++) {
+      const ang = Math.random() * ORCH2_TAU;
+      const sp = (90 + 170 * Math.random()) * f.ds * (0.7 + 0.5 * s);
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      this._spawn(f.cx + ca * f.coreR * 0.15, f.cy + sa * f.coreR * 0.15,
+        ca * sp, sa * sp, 0.6 + 0.6 * Math.random(), (1.3 + 1.2 * Math.random()) * f.ds, 0, 2);
+    }
+  }
+
+  /* ---------- main frame ---------- */
+  draw(audio, now, dt) {
     const ctx = this.ctx;
-    const { width, height } = this;
+    const W = this.width, Ht = this.height;
     const colors = this.theme.getAccentColors();
-    const rowCountSetting = Util.clamp(Math.round(this.settings.get('bandRows') || 7), 7, 40);
-    const bands = rowCountSetting === 7 ? audio.bandDefs : audio.getDynamicBands(rowCountSetting);
+    const styleKey = this.settings.get('orchestraStyle');
+    const st = ORCH2_STYLES[styleKey] || ORCH2_STYLES.flow;
+    const react = st.react;
+
+    const rowSetting = Util.clamp(Math.round(this.settings.get('bandRows') || 7), 7, 15);
+    if (!this._bands || this._bandsKey !== rowSetting) {
+      this._bands = rowSetting === 7 ? audio.bandDefs : audio.getDynamicBands(rowSetting);
+      this._bandsKey = rowSetting;
+    }
+    const bands = this._bands;
     this._ensureRows(bands.length);
-    const rowCount = bands.length;
-    // More breathing room than Orchestra Mode 1 — bigger row gap, a wider
-    // meter column with a chunkier bar, and more clip padding around the
-    // waveform fill so nothing feels crammed edge-to-edge.
+    const rc = bands.length;
+    const n = st.pts;
+    if (n !== this._lastN) { this._lastN = n; this._buildBell(n); }
+
+    const dms = Util.clamp(dt || 16.7, 4, 50);
+    const dts = dms / 1000, dN = dms / 16.667;
+    const ds = Math.max(1, this.dpr * 0.8);
+    this._dash[0] = 3 * ds; this._dash[1] = 3 * ds;
+
+    // --- adaptive quality: thin out particles if frames get slow ---
+    const cap = this.settings.get('targetFps') || 0;
+    const budget = cap > 0 ? 1000 / cap : 16.7;
+    this.dtAvg += (dms - this.dtAvg) * 0.05;
+    this.qualT += dms;
+    if (this.qualT > 700) {
+      this.qualT = 0;
+      if (this.dtAvg > Math.max(26, budget * 1.5) && this.qual > 0.3) this.qual = Math.max(0.3, this.qual - 0.15);
+      else if (this.dtAvg < Math.max(19, budget * 1.15) && this.qual < 1) this.qual = Math.min(1, this.qual + 0.05);
+    }
+    const pc = this.settings.get('particleCount') || 600;
+    this._pCap = Math.max(60, Math.min(this.PCAP, Math.round(pc * 0.55 * (0.35 + 0.65 * this.qual) * Math.max(1, st.parts * 0.7))));
+    if (this.pCursor >= this._pCap) this.pCursor = 0;
+
+    // --- audio features -> smoothed global state ---
+    audio.requestStereo();
+    const m = audio.metrics, sens = audio.sensitivity, sm = m.stereo;
+    if (this._beatSeen < 0 || audio.beatCount < this._beatSeen) this._beatSeen = audio.beatCount;
+    else if (audio.beatCount !== this._beatSeen) { this._beatSeen = audio.beatCount; this._pendingBeat = audio.beatStrength; }
+
+    const loudT = Util.clamp(m.rms * sens * 3.2, 0, 1);
+    this.loud += (loudT - this.loud) * orchK(loudT > this.loud ? 0.25 : 0.015, dN); // slow decay into silence
+    this.bassE += (m.bass - this.bassE) * orchK(m.bass > this.bassE ? 0.30 : 0.06, dN);
+    this.midE += (m.mid - this.midE) * orchK(m.mid > this.midE ? 0.30 : 0.08, dN);
+    this.trebE += (m.treble - this.trebE) * orchK(m.treble > this.trebE ? 0.50 : 0.15, dN);
+    const fluxRel = Util.clamp((m.flux / (m.fluxAvg + 0.03) - 1) * 0.5, 0, 1);
+    this.fluxEnv = Math.max(fluxRel, this.fluxEnv * Math.pow(0.88, dN));
+    if (sm.active) {
+      this.stWidth += (sm.width - this.stWidth) * orchK(0.08, dN);
+      this.corr += (sm.corr - this.corr) * orchK(0.08, dN);
+    }
+    this.centroid += (m.centroid - this.centroid) * orchK(0.05, dN);
+
+    // --- geometry ---
     const rowGap = 7;
-    const rowHeight = (height - rowGap * (rowCount - 1)) / rowCount;
-
-    ctx.clearRect(0, 0, width, height);
-
-    const leftColW = Math.min(150, width * 0.22);
-    const rightColW = Math.min(150, width * 0.21);
-    const centerX = leftColW;
-    const centerW = width - leftColW - rightColW;
+    const rowHeight = (Ht - rowGap * (rc - 1)) / rc;
+    const leftColW = Math.min(150, W * 0.22);
+    const rightColW = Math.min(150, W * 0.21);
+    const centerX = leftColW, centerW = W - leftColW - rightColW;
     const nyquist = (audio.sampleRate || 44100) / 2;
-    const meterBarHeight = 12;
+    const step = centerW / (n - 1);
+    for (let p = 0; p < n; p++) this._xs[p] = centerX + p * step;
 
-    for (let i = 0; i < rowCount; i++) {
+    const f = this._f;
+    f.ctx = ctx; f.st = st; f.n = n; f.ds = ds; f.now = now; f.dts = dts; f.dN = dN;
+    f.centerX = centerX; f.centerW = centerW; f.W = W; f.H = Ht;
+    f.cx = centerX + centerW / 2;
+    f.cy = Ht * (0.5 + (this.centroid - 0.5) * 0.16);
+    f.coreR = Math.min(centerW * 0.34, Ht * 0.46);
+    f.colors = colors;
+
+    // --- beat event + envelopes with real attack/decay ---
+    if (this._pendingBeat > 0) { this._onBeat(this._pendingBeat); this._pendingBeat = 0; }
+    this.kickT *= Math.pow(0.86, dN);
+    this.kick += (this.kickT - this.kick) * orchK(this.kickT > this.kick ? 0.35 : 0.10, dN);
+    this.corePulseT *= Math.pow(0.90, dN);
+    this.corePulse += (this.corePulseT - this.corePulse) * orchK(this.corePulseT > this.corePulse ? 0.30 : 0.07, dN);
+    this.flashT *= Math.pow(0.88, dN);
+    this.flash += (this.flashT - this.flash) * orchK(this.flashT > this.flash ? 0.40 : 0.10, dN);
+    const coreT = Util.clamp(this.loud * 0.75 + this.bassE * 0.45, 0, 1);
+    this.coreE += (coreT - this.coreE) * orchK(coreT > this.coreE ? 0.20 : 0.012, dN);
+    f.bright = 1 + this.flash * 0.35 * react + this.loud * 0.12 + (this.centroid - 0.5) * 0.10;
+
+    // --- shockwaves travelling from the foundation up through every band ---
+    const speed = rc / 0.85;
+    for (let s = 0; s < this.SH; s++) {
+      if (this.shStr[s] <= 0.02) continue;
+      this.shPos[s] += speed * dts;
+      this.shStr[s] *= Math.pow(0.5, dts);
+      if (this.shPos[s] > rc + 2) this.shStr[s] = 0;
+    }
+    this.rowShock.fill(0);
+    const shW = Math.max(1.2, rc * 0.1);
+    for (let s = 0; s < this.SH; s++) {
+      if (this.shStr[s] <= 0.02) continue;
+      for (let i = 0; i < rc; i++) {
+        const d = (i - this.shPos[s]) / shW;
+        if (d > -3 && d < 3) this.rowShock[i] += this.shStr[s] * Math.exp(-d * d);
+      }
+    }
+
+    // ===== PASS A: per-row analysis (energy, transients, stereo, per-point samples) =====
+    let active = 0;
+    for (let i = 0; i < rc; i++) {
       const band = bands[i];
-      const y = i * (rowHeight + rowGap);
-      const energy = audio.getBandEnergy(band.lo, band.hi) / 255 * audio.sensitivity;
+      const ci = ORCH2_CAT[band.icon] === undefined ? 3 : ORCH2_CAT[band.icon];
+      this.rowCat[i] = ci;
+      const raw = Util.clamp(audio.getBandEnergy(band.lo, band.hi) / 255 * sens, 0, 1.2);
 
+      // Meter value keeps the original response so the dB/% readouts behave as before.
       const prev = this.bandSmoothed[i];
-      const smoothed = prev + (energy - prev) * (energy > prev ? 0.45 : 0.12);
+      const smoothed = prev + (raw - prev) * orchK(raw > prev ? 0.45 : 0.12, dN);
       this.bandSmoothed[i] = smoothed;
-
       if (smoothed >= this.bandPeaks[i]) {
         this.bandPeaks[i] = smoothed;
         this.bandPeakHold[i] = now + 900;
@@ -1938,119 +2626,537 @@ class OrchestraModeV2 extends OrchestraBase {
         this.bandPeaks[i] = Math.max(smoothed, this.bandPeaks[i] - 0.006);
       }
 
-      // Row background card
-      ctx.fillStyle = `rgba(${colors.accent.r},${colors.accent.g},${colors.accent.b},0.035)`;
-      this._roundRect(ctx, 0, y, width, rowHeight, 8);
-      ctx.fill();
+      // Instantaneous level + transient (fast level vs slow baseline)
+      let fast = this.rowFast[i];
+      fast += (raw - fast) * orchK(raw > fast ? 0.85 : 0.35, dN);
+      this.rowFast[i] = fast;
+      let slow = this.rowSlow[i];
+      slow += (raw - slow) * orchK(0.05, dN);
+      this.rowSlow[i] = slow;
+      const trNow = Util.clamp((raw - slow - 0.02) * 3.4, 0, 1);
+      const trPrev = this.rowTrans[i];
+      this.rowTrans[i] = Math.max(trNow, trPrev * Math.pow(ORCH2_TRANS_KEEP[ci], dN));
+      this.rowCool[i] -= dts;
+      if (trNow > 0.55 && trPrev < 0.45 && this.rowCool[i] <= 0) {
+        this.rowCool[i] = 0.14;
+        this.rowBurst[i] = trNow;
+        if (react > 1.2 && ci <= 3) this._startShock(i - 0.6, 0.45 * trNow);
+      }
+      if (fast > 0.22) active++;
 
-      this._drawLeftColumn(ctx, band, y, rowHeight, colors, smoothed);
+      // Stereo balance for this band (-1 left .. +1 right)
+      const lr = audio.getBandLR(band.lo, band.hi);
+      const bt = (lr[1] - lr[0]) / (lr[1] + lr[0] + 0.004);
+      this.rowBal[i] += (bt - this.rowBal[i]) * orchK(0.12, dN);
 
-      // --- CENTER: filled waveform area, anchored in place ---
-      // Sample N fixed points across an EXTENDED slice of the spectrum —
-      // each row now reaches a bit into its neighboring bands (and the
-      // final row reaches all the way to Nyquist) instead of being
-      // strictly boxed into its nominal Hz range, so the silhouette
-      // reflects more of the surrounding spectrum. Each point's
-      // x-position is still permanent — only its height changes frame to
-      // frame. No scrolling, no shifting buffer.
+      // Per-point samples across an extended slice of the spectrum (same
+      // mapping as before) with a band-specific attack/release.
       const bandSpan = band.hi - band.lo;
       const extLo = i === 0 ? 0 : Math.max(0, band.lo - bandSpan * 0.25);
-      const extHi = i === rowCount - 1 ? nyquist : band.hi + bandSpan * 0.25;
-      const samples = this.rowSamples[i];
-      const envelope = this.rowEnvelope[i];
-      const floor = this.rowFloor[i];
-      const n = this.pointsPerRow;
+      const extHi = i === rc - 1 ? nyquist : band.hi + bandSpan * 0.25;
       const span = extHi - extLo;
+      const atk = orchK(ORCH2_ATK[ci], dN), rel = orchK(ORCH2_REL[ci], dN);
+      const S = this.samples[i], E = this.envelope[i];
       for (let p = 0; p < n; p++) {
-        const loP = extLo + (p / n) * span;
-        const hiP = extLo + ((p + 1) / n) * span;
-        const raw = audio.getBandEnergy(loP, hiP) / 255 * audio.sensitivity;
-        const sPrev = samples[p];
-        samples[p] = sPrev + (raw - sPrev) * (raw > sPrev ? 0.5 : 0.15);
-
-        // Slow-decaying ceiling line: snaps up instantly with the signal,
-        // then eases back down, tracing recent local maxima above the
-        // live silhouette — a second, independent variable per point.
-        if (samples[p] >= envelope[p]) envelope[p] = samples[p];
-        else envelope[p] = Math.max(samples[p], envelope[p] - 0.008);
-
-        // Slow-rising floor line: snaps down instantly with the signal,
-        // then eases back up, tracing recent local minima below the live
-        // silhouette — a third, independent variable per point.
-        if (samples[p] <= floor[p]) floor[p] = samples[p];
-        else floor[p] = Math.min(samples[p], floor[p] + 0.006);
+        const rp = audio.getBandEnergy(extLo + (p / n) * span, extLo + ((p + 1) / n) * span) / 255 * sens;
+        const sp = S[p];
+        S[p] = sp + (rp - sp) * (rp > sp ? atk : rel);
+        if (S[p] >= E[p]) E[p] = S[p];
+        else E[p] = Math.max(S[p], E[p] - 0.008 * dN);
       }
+    }
+
+    // Formation: when many bands are active together they pull into one structure
+    const act = active / rc;
+    const formT = Util.clamp((act - 0.35) / 0.5, 0, 1);
+    this.form += (formT - this.form) * orchK(formT > this.form ? 0.10 : 0.04, dN);
+    f.form = this.form;
+
+    // ===== PASS B: displayed curves (coupling, shock, kick, stereo, formation) =====
+    const kickAmt = this.kick * react;
+    const couple = 0.06 + 0.10 * this.form;
+    const widthMix = Util.clamp(0.2 + this.stWidth * 1.1, 0.2, 1);
+    const bell = this._bell;
+    for (let i = 0; i < rc; i++) {
+      const ci = this.rowCat[i];
+      const S = this.samples[i], D = this.disp[i];
+      const Sa = this.samples[i > 0 ? i - 1 : i], Sb = this.samples[i < rc - 1 ? i + 1 : i];
+      const nTrans = 0.5 * (this.rowTrans[i > 0 ? i - 1 : i] + this.rowTrans[i < rc - 1 ? i + 1 : i]);
+      const gain = 1 + 0.28 * this.rowShock[i] + (ci <= 1 ? 0.30 : 0.08) * kickAmt + 0.15 * nTrans;
+      const lift = this.bassE * 0.07 * Math.sin(now * 0.0032 - i * 0.75);
+      const bal = this.rowBal[i];
+      const fast = this.rowFast[i];
+      for (let p = 0; p < n; p++) {
+        const u = p / (n - 1);
+        let v = S[p] + couple * 0.5 * (Sa[p] + Sb[p]);
+        v *= gain;
+        v *= 1 + bal * (u - 0.5) * 1.1;                                   // left/right tilt
+        v *= bell[p] + (1 - bell[p]) * widthMix;                          // mono collapses to centre
+        v *= 1 + 0.18 * this.form * Math.sin(Math.PI * u);                // shared formation arch
+        if (ci === 2) v += 0.05 * fast * Math.sin(u * ORCH2_TAU * 1.15 + now * 0.0007);
+        if (st.field) { const d = (u - 0.5) / 0.2; v *= 1 + 0.4 * this.coreE * Math.exp(-d * d); }
+        v += lift;
+        D[p] = v < 0 ? 0 : v > 1.25 ? 1.25 : v;
+      }
+      if (ci <= 1) this._blur(D, n, ci === 0 ? 3 : 2);
+      else if (ci === 2) this._blur(D, n, 2);
+    }
+
+    // ===== DRAW =====
+    ctx.clearRect(0, 0, W, Ht);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    this._drawCore(colors);
+
+    const meterBarHeight = 12;
+    for (let i = 0; i < rc; i++) {
+      const band = bands[i];
+      const y = i * (rowHeight + rowGap);
+      const ci = this.rowCat[i];
+      const c = ci <= 1 ? colors.accent : ci <= 4 ? colors.accent3 : colors.accent2;
+      const smoothed = this.bandSmoothed[i];
+
+      ctx.fillStyle = this._rgba(colors.accent, 0.035 + 0.05 * Math.min(1, this.rowShock[i]) + 0.02 * this.flash);
+      this._roundRect(ctx, 0, y, W, rowHeight, 8);
+      ctx.fill();
+      // soft tint on the meter side that follows this band's instant energy
+      ctx.fillStyle = this._rgba(c, 0.05 * this.rowFast[i]);
+      ctx.fillRect(W - rightColW, y + 2, rightColW - 4, rowHeight - 4);
+
+      this._drawLeftColumn(ctx, band, y, rowHeight, colors, smoothed);
 
       ctx.save();
       ctx.beginPath();
       ctx.rect(centerX, y + 3, centerW, rowHeight - 6);
       ctx.clip();
-
-      const baseY = y + rowHeight - 5;
-      const topY = y + 5;
-      const step = centerW / (n - 1);
-
-      const silPts = [];
-      for (let p = 0; p < n; p++) {
-        silPts.push({ x: centerX + p * step, y: baseY - samples[p] * (rowHeight - 12) });
-      }
-      ctx.beginPath();
-      ctx.moveTo(centerX, baseY);
-      ctx.lineTo(silPts[0].x, silPts[0].y);
-      this.smoothPath(ctx, silPts);
-      ctx.lineTo(centerX + (n - 1) * step, baseY);
-      ctx.closePath();
-
-      const grad = ctx.createLinearGradient(0, topY, 0, baseY);
-      const c = i < 2 ? colors.accent : i < 5 ? colors.accent3 : colors.accent2;
-      grad.addColorStop(0, `rgba(${c.r},${c.g},${c.b},0.75)`);
-      grad.addColorStop(1, `rgba(${c.r},${c.g},${c.b},0.05)`);
-      ctx.fillStyle = grad;
-      ctx.fill();
-
-      ctx.strokeStyle = `rgba(${c.r},${c.g},${c.b},0.9)`;
-      ctx.lineWidth = 1.4;
-      ctx.lineJoin = 'round';
-      ctx.beginPath();
-      ctx.moveTo(silPts[0].x, silPts[0].y);
-      this.smoothPath(ctx, silPts);
-      ctx.stroke();
-
-      // Envelope/ceiling line — a second, lighter dashed trace riding
-      // above the live silhouette.
-      ctx.strokeStyle = `rgba(${colors.accent2.r},${colors.accent2.g},${colors.accent2.b},0.65)`;
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
-      const envPts = Array.from({ length: n }, (_, p) => ({ x: centerX + p * step, y: baseY - envelope[p] * (rowHeight - 12) }));
-      ctx.beginPath();
-      ctx.moveTo(envPts[0].x, envPts[0].y);
-      this.smoothPath(ctx, envPts);
-      ctx.stroke();
-
-      // Floor line — a third, dotted trace riding below the live
-      // silhouette, in a color distinct from both the silhouette and the
-      // ceiling so all three read as separate variables at a glance.
-      ctx.strokeStyle = `rgba(${colors.accent3.r},${colors.accent3.g},${colors.accent3.b},0.6)`;
-      ctx.lineWidth = 1;
-      ctx.setLineDash([1, 3]);
-      const floorPts = Array.from({ length: n }, (_, p) => ({ x: centerX + p * step, y: baseY - floor[p] * (rowHeight - 12) }));
-      ctx.beginPath();
-      ctx.moveTo(floorPts[0].x, floorPts[0].y);
-      this.smoothPath(ctx, floorPts);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      this._renderRow(i, y, rowHeight, colors, c);
       ctx.restore();
 
-      this._drawRightMeter(ctx, width, rightColW, y, rowHeight, smoothed, this.bandPeaks[i], colors, c, meterBarHeight);
+      this._emitRow(i, y, rowHeight, c);
+      this.prevDisp[i].set(this.disp[i]);
+
+      this._drawBandMeter(ctx, W, rightColW, y, rowHeight, i, smoothed, this.bandPeaks[i], colors, c, meterBarHeight);
+    }
+
+    this._updateParticles(dts, centerX, centerX + centerW, Ht);
+    this._drawParticles(colors);
+  }
+
+  /* ---------- central energy field ---------- */
+  _drawCore(colors) {
+    const f = this._f, ctx = this.ctx, st = f.st, ds = f.ds;
+    const cx = f.cx, cy = f.cy, R = f.coreR;
+    const e = this.coreE, pulse = this.corePulse;
+    const r = R * (0.16 + 0.48 * e + 0.28 * this.bassE) + R * 0.42 * pulse;
+    const a = Util.clamp((0.04 + 0.26 * e + 0.30 * pulse + 0.10 * this.flash) * st.core, 0, 0.75);
+    const t = this.centroid;
+    const squash = 1 + Util.clamp(this.stWidth * (1.1 - 0.6 * Math.max(0, this.corr)), 0, 1.2) * 0.9;
+
+    // faint vertical "spine" that ties the rows together when the formation is strong
+    if (this.form > 0.05 && !st.minimal) {
+      const g = ctx.createLinearGradient(0, 0, 0, f.H);
+      g.addColorStop(0, this._mixRgba(colors.accent, colors.accent2, 0, 0));
+      g.addColorStop(0.5, this._mixRgba(colors.accent, colors.accent2, t, 0.10 * this.form));
+      g.addColorStop(1, this._mixRgba(colors.accent, colors.accent2, 1, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(cx - 1.5 * ds, 0, 3 * ds, f.H);
+    }
+
+    if (a >= 0.01) {
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(squash, 1);
+      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, Math.max(2, r));
+      g.addColorStop(0, `rgba(${Math.min(255, (colors.accent.r + (colors.accent2.r - colors.accent.r) * t + 90) | 0)},${Math.min(255, (colors.accent.g + (colors.accent2.g - colors.accent.g) * t + 90) | 0)},${Math.min(255, (colors.accent.b + (colors.accent2.b - colors.accent.b) * t + 90) | 0)},${+(a * 0.9).toFixed(3)})`);
+      g.addColorStop(0.35, this._mixRgba(colors.accent, colors.accent2, t, a * 0.5));
+      g.addColorStop(1, this._mixRgba(colors.accent, colors.accent2, t, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(0, 0, Math.max(2, r), 0, ORCH2_TAU);
+      ctx.fill();
+
+      if (st.field) {   // concentric field lines
+        ctx.lineWidth = ds;
+        for (let k = 1; k <= 2; k++) {
+          ctx.strokeStyle = this._mixRgba(colors.accent, colors.accent2, t, (0.05 + 0.10 * e) / k);
+          ctx.beginPath();
+          ctx.arc(0, 0, r * (1 + k * 0.7), 0, ORCH2_TAU);
+          ctx.stroke();
+        }
+      }
+      // beat shockwave rings
+      ctx.lineWidth = 1.2 * ds;
+      for (let k = 0; k < this.RN; k++) {
+        if (this.ringA[k] < 0.02) continue;
+        this.ringR[k] += f.coreR * 1.4 * f.dts;
+        this.ringA[k] *= Math.pow(0.25, f.dts);
+        ctx.strokeStyle = this._mixRgba(colors.accent, colors.accent2, t, this.ringA[k] * 0.6 * st.core);
+        ctx.beginPath();
+        ctx.arc(0, 0, this.ringR[k], 0, ORCH2_TAU);
+        ctx.stroke();
+      }
+      ctx.restore();
+    } else {
+      for (let k = 0; k < this.RN; k++) this.ringA[k] = 0;
     }
   }
 
+  /* ---------- one row: look depends on the band family ---------- */
+  _renderRow(i, y, rh, colors, c) {
+    const F = this._f, ctx = F.ctx, st = F.st, n = F.n, ds = F.ds, now = F.now;
+    const ci = this.rowCat[i], D = this.disp[i];
+    const xs = this._xs, ya = this._ya, yb = this._yb, yc = this._yc, yd = this._yd;
+    const baseY = y + rh - 5, topY = y + 5, H = rh - 12;
+    const energy = this.rowFast[i], tr = this.rowTrans[i];
+    const kick = this.kick * st.react;
+    const fillK = st.fill;
+
+    for (let p = 0; p < n; p++) ya[p] = baseY - D[p] * H;
+
+    if (st.minimal) {
+      ctx.fillStyle = this._rgba(c, 0.10);
+      this._fillPath(ctx, xs, ya, n, baseY);
+      ctx.fill();
+      ctx.strokeStyle = this._rgba(c, this._a(0.85));
+      ctx.lineWidth = Math.max(1, ds);
+      this._linePath(ctx, xs, ya, n);
+      ctx.stroke();
+      return;
+    }
+
+    if (st.aurora) { this._renderAurora(i, y, rh, colors, c, baseY, H); return; }
+
+    const add = st.additive;
+    const stream = !!st.stream;
+
+    switch (ci) {
+      case 0:
+      case 1: { // FOUNDATION: thick, smooth, big, glowing underneath
+        if (!stream) {
+          const g = ctx.createLinearGradient(0, topY, 0, baseY);
+          g.addColorStop(0, this._rgba(c, this._a((0.55 + 0.25 * kick) * fillK)));
+          g.addColorStop(1, this._rgba(c, 0.04));
+          ctx.fillStyle = g;
+          this._fillPath(ctx, xs, ya, n, baseY);
+          ctx.fill();
+        }
+        this._linePath(ctx, xs, ya, n);
+        if (add) ctx.globalCompositeOperation = 'lighter';
+        ctx.strokeStyle = this._rgba(c, this._a(stream ? 0.05 : 0.10 + 0.10 * kick));
+        ctx.lineWidth = ds * (7 + 4 * kick);
+        ctx.stroke();
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.strokeStyle = this._rgba(c, this._a(stream ? 0.35 : 0.95));
+        ctx.lineWidth = ds * (stream ? 1.2 : 2.3 + 1.1 * kick);
+        ctx.stroke();
+        break;
+      }
+      case 2: { // LOW MID: broad flowing hills and valleys
+        if (!stream) {
+          const g = ctx.createLinearGradient(0, topY, 0, baseY);
+          g.addColorStop(0, this._rgba(c, this._a(0.60 * fillK)));
+          g.addColorStop(1, this._rgba(c, 0.04));
+          ctx.fillStyle = g;
+          this._fillPath(ctx, xs, ya, n, baseY);
+          ctx.fill();
+        }
+        this._linePath(ctx, xs, ya, n);
+        ctx.strokeStyle = this._rgba(c, this._a(stream ? 0.30 : 0.92));
+        ctx.lineWidth = ds * (stream ? 1 : 1.8);
+        ctx.stroke();
+        break;
+      }
+      case 3: { // MID: several interacting waveform layers
+        const ph = now * 0.0011 + i;
+        const amp = 0.8 + 3.4 * (0.3 + this.midE) + 2 * this.fluxEnv;
+        this._shifted(D, n, Math.sin(ph) * amp, 0.84, baseY, H, yb);
+        this._shifted(D, n, Math.cos(ph * 1.53 + 1.7) * amp * 1.5, 0.66, baseY, H, yc);
+        if (!stream) {
+          const g = ctx.createLinearGradient(0, topY, 0, baseY);
+          g.addColorStop(0, this._rgba(c, this._a(0.45 * fillK)));
+          g.addColorStop(1, this._rgba(c, 0.03));
+          ctx.fillStyle = g;
+          this._fillPath(ctx, xs, ya, n, baseY);
+          ctx.fill();
+          ctx.fillStyle = this._rgba(colors.accent2, 0.09 + 0.10 * this.fluxEnv);   // the "weave" between layers
+          this._bandPath(ctx, xs, ya, yb, n);
+          ctx.fill();
+        }
+        if (add) ctx.globalCompositeOperation = 'lighter';
+        ctx.lineWidth = ds * 1.1;
+        ctx.strokeStyle = this._rgba(colors.accent, this._a(0.35));
+        this._linePath(ctx, xs, yc, n); ctx.stroke();
+        ctx.lineWidth = ds * 1.3;
+        ctx.strokeStyle = this._rgba(colors.accent2, this._a(0.55));
+        this._linePath(ctx, xs, yb, n); ctx.stroke();
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.lineWidth = ds * 1.6;
+        ctx.strokeStyle = this._rgba(c, this._a(stream ? 0.35 : 0.95));
+        this._linePath(ctx, xs, ya, n); ctx.stroke();
+        break;
+      }
+      case 4: { // HIGH MID: thin, fast, energetic ribbons
+        const th = ds * (0.5 + 2.2 * tr + 1.2 * energy);
+        const wob = ds * (0.4 + 2.5 * tr);
+        for (let p = 0; p < n; p++) {
+          const w = Math.sin(p * 0.9 + now * 0.012) * wob;
+          yb[p] = ya[p] + w - th - D[p] * ds;
+          yc[p] = ya[p] + w + th + D[p] * ds;
+        }
+        if (add) ctx.globalCompositeOperation = 'lighter';
+        ctx.fillStyle = this._rgba(c, this._a((0.20 + 0.30 * tr) * (stream ? 0.4 : 1)));
+        this._bandPath(ctx, xs, yb, yc, n);
+        ctx.fill();
+        // a second ribbon, phase-shifted, so they braid
+        this._shifted(D, n, Math.sin(now * 0.004 + i) * 2.5, 0.9, baseY, H, yd);
+        ctx.strokeStyle = this._rgba(colors.accent2, this._a(0.45));
+        ctx.lineWidth = ds;
+        this._linePath(ctx, xs, yd, n); ctx.stroke();
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.strokeStyle = this._rgba(c, this._a(0.95));
+        ctx.lineWidth = ds * 1.1;
+        for (let p = 0; p < n; p++) yb[p] = ya[p] + Math.sin(p * 0.9 + now * 0.012) * wob;
+        this._linePath(ctx, xs, yb, n); ctx.stroke();
+        break;
+      }
+      case 5: { // PRESENCE: fine line; particles follow it (see _emitRow)
+        if (!stream) {
+          ctx.fillStyle = this._rgba(c, this._a(0.28 * fillK));
+          this._fillPath(ctx, xs, ya, n, baseY);
+          ctx.fill();
+        }
+        ctx.strokeStyle = this._rgba(c, this._a(stream ? 0.25 : 0.65));
+        ctx.lineWidth = ds * 0.9;
+        this._linePath(ctx, xs, ya, n); ctx.stroke();
+        break;
+      }
+      default: { // BRILLIANCE: hair-thin luminous lines (stars come from _emitRow)
+        if (add) ctx.globalCompositeOperation = 'lighter';
+        this._linePath(ctx, xs, ya, n);
+        ctx.strokeStyle = this._rgba(c, this._a(0.09));
+        ctx.lineWidth = ds * 3.2;
+        ctx.stroke();
+        ctx.strokeStyle = this._rgba(c, this._a(stream ? 0.30 : 0.95));
+        ctx.lineWidth = Math.max(1, ds * 0.8);
+        ctx.stroke();
+        this._shifted(D, n, Math.sin(now * 0.009 + i) * 1.5, 0.94, baseY, H, yb);
+        for (let p = 0; p < n; p++) yb[p] -= 1.6 * ds;
+        ctx.strokeStyle = this._rgba(colors.accent3, this._a(0.35));
+        ctx.lineWidth = Math.max(1, ds * 0.6);
+        this._linePath(ctx, xs, yb, n); ctx.stroke();
+        ctx.globalCompositeOperation = 'source-over';
+        break;
+      }
+    }
+
+    // peak-hold ceiling (kept from the original, hairline now) on the lower bands
+    if (ci <= 3 && !stream) {
+      const E = this.envelope[i];
+      for (let p = 0; p < n; p++) yd[p] = baseY - E[p] * H;
+      ctx.setLineDash(this._dash);
+      ctx.strokeStyle = this._rgba(colors.accent2, 0.35);
+      ctx.lineWidth = Math.max(1, ds * 0.7);
+      this._linePath(ctx, xs, yd, n); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // AURORA: luminous flowing ribbons instead of filled graphs
+  _renderAurora(i, y, rh, colors, c, baseY, H) {
+    const F = this._f, ctx = F.ctx, st = F.st, n = F.n, ds = F.ds, now = F.now;
+    const ci = this.rowCat[i], xs = this._xs, ya = this._ya;
+    const energy = this.rowFast[i];
+    const kick = this.kick * st.react;
+    const flow = H * 0.06 * (0.25 + energy);
+    for (let p = 0; p < n; p++) {
+      ya[p] += Math.sin((p / (n - 1)) * ORCH2_TAU * 1.4 + now * 0.0007 * (1 + ci * 0.15) + i * 0.9) * flow;
+    }
+    const g = ctx.createLinearGradient(0, baseY - H, 0, baseY);
+    g.addColorStop(0, this._rgba(c, this._a(0.30 * st.fill)));
+    g.addColorStop(1, this._rgba(c, 0));
+    ctx.fillStyle = g;
+    this._fillPath(ctx, xs, ya, n, baseY);
+    ctx.fill();
+
+    const hg = ctx.createLinearGradient(F.centerX, 0, F.centerX + F.centerW, 0);
+    const other = ci <= 4 ? colors.accent2 : colors.accent;
+    hg.addColorStop(0, this._rgba(c, 1));
+    hg.addColorStop(0.5, this._mixRgba(c, other, 0.5, 1));
+    hg.addColorStop(1, this._rgba(other, 1));
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = hg;
+    this._linePath(ctx, xs, ya, n);
+    const k = ci <= 1 ? 1 + 0.6 * kick : 1;
+    const widths = [9 * k, 5, 2.2, 1.0], alphas = [0.05, 0.09, 0.32, 0.9];
+    for (let w = 0; w < 4; w++) {
+      ctx.globalAlpha = this._a(alphas[w]);
+      ctx.lineWidth = ds * widths[w];
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---------- particles inherit motion from the curves ---------- */
+  _emitRow(i, y, rh, c) {
+    const F = this._f, st = F.st, n = F.n, ds = F.ds;
+    const k = st.parts * this.qual;
+    if (k <= 0.02) return;
+    const ci = this.rowCat[i];
+    const D = this.disp[i], PD = this.prevDisp[i], xs = this._xs;
+    const baseY = y + rh - 5, H = rh - 12;
+    const e = this.rowFast[i], tr = this.rowTrans[i];
+    const colIdx = ci <= 1 ? 0 : ci <= 4 ? 1 : 2;
+    const bal = this.rowBal[i];
+
+    let rate = 0;
+    if (ci === 5) rate = 5 + 55 * e + 70 * this.fluxEnv;
+    else if (ci === 6) rate = 6 + 70 * e + 140 * tr;
+    else if (st.stream) rate = (ci <= 1 ? 3 : 5) + 30 * e;
+    else if (ci === 4) rate = 40 * tr;
+    else if (ci === 3 && st.react > 1.2) rate = 25 * tr;
+    rate *= k;
+    this.emitAcc[i] += rate * F.dts;
+    let cnt = this.emitAcc[i] | 0;
+    if (cnt > 6) { cnt = 6; this.emitAcc[i] = 0; } else this.emitAcc[i] -= cnt;
+
+    for (let q = 0; q < cnt; q++) {
+      let p = 0;
+      for (let t = 0; t < 3; t++) { p = (Math.random() * n) | 0; if (D[p] > Math.random() * 0.8) break; }
+      const px = xs[p], py = baseY - D[p] * H;
+      const slope = D[p + 1 < n ? p + 1 : p] - D[p > 0 ? p - 1 : p];
+      const dv = D[p] - PD[p];
+      const vy = -((ci === 6 ? 30 + 90 * Math.random() : 14 + 34 * Math.random()) * ds) - Math.max(0, dv) * H * 40;
+      const vx = (Math.random() - 0.5) * 14 * ds - slope * H * 3 + bal * 55 * ds;
+      const life = ci === 6 ? 0.35 + 0.55 * Math.random() : 0.5 + 0.5 * Math.random();
+      const size = (ci === 6 ? 0.9 + 0.8 * Math.random() : ci === 5 ? 1.2 : 1.5) * ds;
+      this._spawn(px, py, vx, vy, life, size, colIdx, ci === 6 ? 1 : 0);
+    }
+
+    // Transient burst: sparks leave from the tallest point of the spike
+    if (this.rowBurst[i] > 0) {
+      const b = this.rowBurst[i];
+      this.rowBurst[i] = 0;
+      if (ci >= 3 || st.react > 1.2) {
+        let pk = 0;
+        for (let p = 1; p < n; p++) if (D[p] > D[pk]) pk = p;
+        const num = Math.round((3 + 6 * b) * k);
+        for (let q = 0; q < num; q++) {
+          this._spawn(xs[pk], baseY - D[pk] * H,
+            (Math.random() - 0.5) * 80 * ds + bal * 70 * ds, -(110 + 150 * Math.random()) * ds,
+            0.3 + 0.4 * Math.random(), (1 + Math.random()) * ds, colIdx, 3);
+        }
+      }
+    }
+  }
+
+  _updateParticles(dts, left, right, bottom) {
+    const drag = Math.pow(0.12, dts);
+    for (let i = 0; i < this.PCAP; i++) {
+      if (this.pLife[i] <= 0) continue;
+      this.pLife[i] -= dts;
+      if (this.pLife[i] <= 0) continue;
+      if (this.pKind[i] === 2) { this.pVX[i] *= drag; this.pVY[i] *= drag; }
+      this.pX[i] += this.pVX[i] * dts;
+      this.pY[i] += this.pVY[i] * dts;
+      if (this.pX[i] < left || this.pX[i] > right || this.pY[i] < -10 || this.pY[i] > bottom + 10) this.pLife[i] = 0;
+    }
+  }
+
+  _drawParticles(colors) {
+    const F = this._f, ctx = this.ctx, ds = F.ds, now = F.now;
+    let live = 0, stars = 0;
+    for (let i = 0; i < this.PCAP; i++) {
+      if (this.pLife[i] <= 0) { this.pKey[i] = 255; continue; }
+      let a = this.pLife[i] / this.pMax[i];
+      if (this.pKind[i] === 1) { a *= 0.6 + 0.4 * Math.sin(this.pPh[i] + now * 0.012); if (this.pSize[i] > 1.7 * ds) stars++; }
+      const b = a > 0.75 ? 3 : a > 0.5 ? 2 : a > 0.25 ? 1 : 0;
+      this.pKey[i] = this.pCol[i] * 4 + b;
+      live++;
+    }
+    if (!live) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(F.centerX, 0, F.centerW, F.H);
+    ctx.clip();
+    if (F.st.additive) ctx.globalCompositeOperation = 'lighter';
+    const palette = [colors.accent, colors.accent3, colors.accent2];
+    const alphaOf = [0.18, 0.38, 0.62, 0.9];
+    for (let col = 0; col < 3; col++) {
+      for (let b = 0; b < 4; b++) {
+        const key = col * 4 + b;
+        const style = this._rgba(palette[col], this._a(alphaOf[b]));
+        ctx.beginPath();
+        let any = false;
+        for (let i = 0; i < this.PCAP; i++) {
+          if (this.pKey[i] !== key) continue;
+          const s = this.pSize[i];
+          ctx.rect(this.pX[i] - s * 0.5, this.pY[i] - s * 0.5, s, s);
+          any = true;
+        }
+        if (any) { ctx.fillStyle = style; ctx.fill(); }
+        if (stars > 0 && col === 2) {
+          ctx.beginPath();
+          let anyStar = false;
+          for (let i = 0; i < this.PCAP; i++) {
+            if (this.pKey[i] !== key || this.pKind[i] !== 1 || this.pSize[i] <= 1.7 * ds) continue;
+            const s = this.pSize[i] * 1.4, x = this.pX[i], y = this.pY[i];
+            ctx.moveTo(x - s, y); ctx.lineTo(x + s, y);
+            ctx.moveTo(x, y - s); ctx.lineTo(x, y + s);
+            anyStar = true;
+          }
+          if (anyStar) { ctx.strokeStyle = style; ctx.lineWidth = Math.max(1, ds * 0.7); ctx.stroke(); }
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  /* Right column: the original dB/% bar, now paired with a vertical meter that
+     shows the band's instantaneous energy (fast, un-smoothed) and flashes on
+     transients. The numbers stay, but quieter. */
+  _drawBandMeter(ctx, width, rightColW, y, rowHeight, i, smoothed, peak, colors, c, barHeight) {
+    const fast = Util.clamp(this.rowFast[i], 0, 1), tr = this.rowTrans[i];
+    const vx = width - rightColW + 3, vw = 5, vy = y + 4, vh = rowHeight - 8;
+    ctx.fillStyle = this._rgba(colors.accent, 0.10);
+    this._roundRect(ctx, vx, vy, vw, vh, 2.5);
+    ctx.fill();
+    if (fast > 0.01) {
+      const fh = Math.max(2, vh * fast);
+      ctx.fillStyle = this._rgba(c, 0.9);
+      this._roundRect(ctx, vx, vy + vh - fh, vw, fh, 2.5);
+      ctx.fill();
+      ctx.fillStyle = this._rgba(colors.accent2, 0.25 + 0.7 * tr);
+      ctx.fillRect(vx, vy + vh - fh, vw, 2);
+    }
+
+    const meterX = width - rightColW + 16;
+    const meterW = rightColW - 30;
+    const meterY = y + rowHeight / 2 - barHeight / 2;
+    ctx.fillStyle = this._rgba(colors.accent, 0.12);
+    this._roundRect(ctx, meterX, meterY, meterW, barHeight, barHeight / 2);
+    ctx.fill();
+    ctx.fillStyle = this._rgba(c, 0.9);
+    this._roundRect(ctx, meterX, meterY, Math.max(0, meterW * Util.clamp(smoothed, 0, 1)), barHeight, barHeight / 2);
+    ctx.fill();
+    const peakX = meterX + meterW * Util.clamp(peak, 0, 1);
+    ctx.fillStyle = this._rgba(colors.accent2, 0.95);
+    ctx.fillRect(peakX - 1, meterY - 2, 2, barHeight + 4);
+
+    const db = smoothed > 0.001 ? (20 * Math.log10(smoothed)).toFixed(0) : '-∞';
+    ctx.font = '500 10px "JetBrains Mono", monospace';
+    ctx.fillStyle = this._rgba(colors.accent, 0.5);
+    ctx.textAlign = 'right';
+    ctx.fillText(`${db}dB  ${Math.round(smoothed * 100)}%`, width - 14, meterY + barHeight + 10);
+    ctx.textAlign = 'left';
+  }
+
   reset() {
-    this.bandSmoothed.fill(0);
-    this.bandPeaks.fill(0);
-    for (const arr of this.rowSamples) arr.fill(0);
-    for (const arr of this.rowEnvelope) arr.fill(0);
-    for (const arr of this.rowFloor) arr.fill(0);
+    this._resetGlobals();
+    for (const a of [this.bandSmoothed, this.bandPeaks, this.bandPeakHold, this.rowFast, this.rowSlow,
+    this.rowTrans, this.rowBal, this.rowShock, this.rowCool, this.rowBurst, this.emitAcc]) a.fill(0);
+    for (const g of [this.samples, this.disp, this.prevDisp, this.envelope]) for (const arr of g) arr.fill(0);
+    this._beatSeen = -1;
   }
 }
 
@@ -2125,73 +3231,689 @@ class MeterBankViz extends OrchestraBase {
   }
 }
 
+/* ---------------- MODE: METER BANK 2 (precision multi-band meter) ----------------
+   The advanced counterpart to Meter Bank: same horizontal segmented rows,
+   labels and Hz ranges, but driven by calibrated measurements (see
+   AudioEngine.updateMeters) instead of the cosmetic spectrum bytes.
+
+   Per band:   RMS fill (band-specific attack/release) + peak marker with hold
+               and a timed decay + short-lived transient marker +
+               zone-coloured segments (normal -> critical).
+   Master:     L/R meters, shared dB scale, CLIP latch, PEAK / RMS / LUFS / DYN.
+   Controls:   SENS/GAIN/SMOOTH button (default OFF = calibrated, sliders ignored).
+   Modes:      Spectrum, RMS, Peak, Peak + RMS (default), Stereo, Precision —
+               picked from the pills at the top or Settings -> Meter Bank 2.
+
+   Performance: one canvas, no DOM. Segment tracks are prebuilt Path2Ds (one
+   fill per zone per row), colours come from a palette rebuilt only when the
+   theme colour changes, all state lives in typed arrays allocated once, and
+   readout strings are only rebuilt ~15x/sec. No blur/shadow effects. */
+const MB2 = {
+  MODES: ['spectrum', 'rms', 'peak', 'peakrms', 'stereo', 'precision'],
+  LABELS: {
+    spectrum: ['SPECTRUM', 'SPEC'], rms: ['RMS', 'RMS'], peak: ['PEAK', 'PK'],
+    peakrms: ['PEAK + RMS', 'PK+RMS'], stereo: ['STEREO', 'ST'], precision: ['PRECISION', 'PREC'],
+  },
+  MIN_DB: -60,
+  MAX_SEG: 120,
+  TICKS: [-60, -48, -36, -24, -12, -6, 0],
+  // Per band: [attack ms, release ms, transient threshold dB above the slow average].
+  // Bass is slow, treble is fast — closer to how those ranges actually move.
+  RESPONSE: {
+    'Sub Bass': [90, 450, 6.0], 'Bass 1': [80, 420, 5.5], 'Bass 2': [70, 380, 5.5], 'Bass 3': [60, 340, 5.5],
+    'Low Mid': [45, 260, 5.5], 'Mid': [40, 240, 5.5], 'High Mid': [20, 200, 6.0],
+    'Presence': [12, 120, 6.5], 'Brilliance': [6, 90, 7.0],
+  },
+  DEFAULT_RESPONSE: [40, 240, 5.5],
+  // Level zones by dBFS: Normal < -24 <= Elevated < -12 <= High < -6 <= Near clipping < -1 <= Critical
+  ZONE_EDGES: [-24, -12, -6, -1],
+  ZONE_BASE: [0.55, 0.68, 0.78, 0.90, 1.0], // resting intensity of a lit segment per zone
+  AMBER: [255, 176, 32],
+  RED: [255, 59, 74],
+  MASTER_ATTACK: 40, MASTER_RELEASE: 300,
+  PEAKENV_FALL_DB_S: 60, // Peak-mode fill
+  CLIP_LATCH_MS: 3500,
+  LUFS_TAU_MS: 3000,
+  // Neutral points for the SENS / GAIN / SMOOTH sliders when they are enabled:
+  // 1.0 / 1.0 / 0.78 (the engine defaults) leave the meter exactly as calibrated.
+  NEUTRAL_SMOOTH: 0.78,
+  CTL_LABEL: ['SENS/GAIN/SMOOTH', 'CTRL'],
+};
+
+const mb2Frac = (db) => { const f = (db - MB2.MIN_DB) / -MB2.MIN_DB; return f < 0 ? 0 : f > 1 ? 1 : f; };
+
 class MeterBankV2 extends OrchestraBase {
   constructor(ctx, settings, theme) {
     super(ctx, settings, theme);
-    this.rowCount = 0; // forces _ensureRows to allocate on first draw
-    this._ensureRows(9);
+    this._bands = null;
+    this._n = 0;
+
+    // Palette / style strings (rebuilt only when theme colours change)
+    this._palKey = new Int16Array(6).fill(-1);
+    this._pal = new Array(40).fill('');
+    this._sty = {
+      track: ['', '', '', '', ''], glow: '', grid: '', gridHi: '', txtDim: '', txtMid: '', txtBright: '',
+      marker: 'rgba(255,255,255,0.92)', clipOn: 'rgba(255,59,74,0.95)', clipGhost: '', pillOn: '', pillBorderOn: '',
+      pillBorder: '', balLow: '', balMid: '', balHigh: '', trackNeutral: '',
+    };
+
+    // Cached geometry (rebuilt when the layout changes)
+    this._geo = { row: null, lane: null, master: null };
+    this._layoutKey = '';
+    this._pillW = new Float32Array(6);
+    this._hit = new Float32Array(24);      // 6 pills x [x, y, w, h]
+    this._clipRect = new Float32Array(4);
+    this._ctlRect = new Float32Array(4);    // SENS/GAIN/SMOOTH enable button
+    this._ctlLbl = { on: '', off: '' };
+    this.L = { k: 1, stripX: 0, stripW: 0, rowsY: 0, rowH: 0, rowGap: 0, masterY: 0, masterH: 0, laneH: 0, lanesTop: 0, segH: 0, leftW: 0, narrow: false };
+
+    // Master state (index 0 = L, 1 = R)
+    this.mMs = new Float32Array(2);
+    this.mRmsDb = new Float32Array(2).fill(-120);
+    this.mHold = new Float32Array(2).fill(-120);
+    this.mHoldT = new Float64Array(2);
+    this.statPk = -120; this.statPkT = 0;
+    this.statRms = -120; this.lufsMs = 0;
+    this.clipUntil = 0; this.clipCount = 0;
+    this.shares = new Float32Array(3).fill(1 / 3);
+
+    this._textAt = 0;
+    this.txt = { pk: '—', rms: '—', lufs: '—', dyn: '—', pkU: '—', rmsU: '—', dynU: '—' };
+    this._lastDt = 16;
+    this._lh = new Float32Array(3);
   }
 
-  _ensureRows(rowCount) {
-    if (rowCount === this.rowCount) return;
-    this.rowCount = rowCount;
-    this.bandSmoothed = new Float32Array(rowCount);
-    this.bandPeaks = new Float32Array(rowCount);
-    this.bandPeakHold = new Float32Array(rowCount);
+  _alloc(n) {
+    this._n = n;
+    const n3 = n * 3;
+    this.ms = new Float32Array(n3);
+    this.rmsDb = new Float32Array(n3).fill(-120);
+    this.inst = new Float32Array(n3).fill(-120);
+    this.hold = new Float32Array(n3).fill(-120);
+    this.holdT = new Float64Array(n3);
+    this.pkEnv = new Float32Array(n3).fill(-120);
+    this.slow = new Float32Array(n);
+    this.armed = new Uint8Array(n).fill(1);
+    this.trig = new Float32Array(n);
+    this.lastTrig = new Float64Array(n);
+    this.grp = new Uint8Array(n);
+    this.resp = new Array(n);
+    this.hzTxt = new Array(n);
+    this.rmsTxt = new Array(n).fill('-∞ dB');
+    this.pkTxt = new Array(n).fill('');
+    this.crestTxt = new Array(n).fill('');
+    this.balance = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = this._bands[i];
+      this.resp[i] = MB2.RESPONSE[b.name] || MB2.DEFAULT_RESPONSE;
+      this.grp[i] = /^(Sub|Bass)/.test(b.name) ? 0 : /Mid$/.test(b.name) ? 1 : 2;
+      this.hzTxt[i] = `${b.lo}–${b.hi >= 1000 ? (b.hi / 1000) + 'k' : b.hi} Hz`;
+    }
   }
 
-  draw(audio, now) {
-    const ctx = this.ctx;
-    const { width, height } = this;
-    const colors = this.theme.getAccentColors();
-    const bands = audio.getMeterBank2Bands();
-    this._ensureRows(bands.length);
-    const rowCount = bands.length;
-    const rowGap = rowCount > 16 ? 3 : rowCount > 10 ? 5 : 8;
-    const rowHeight = (height - rowGap * (rowCount - 1)) / rowCount;
-    const showLabels = rowHeight >= 20; // too thin to carry a left column once rows pile up
+  /* ---------------- public bits used by the UI ---------------- */
+  clearClip() { this.clipUntil = 0; }
 
-    ctx.clearRect(0, 0, width, height);
+  _hitAt(x, y) {
+    const h = this._hit;
+    for (let m = 0; m < 6; m++) {
+      const o = m * 4;
+      if (h[o + 2] > 0 && x >= h[o] && x <= h[o] + h[o + 2] && y >= h[o + 1] && y <= h[o + 1] + h[o + 3]) return m;
+    }
+    const c = this._clipRect;
+    if (c[2] > 0 && x >= c[0] && x <= c[0] + c[2] && y >= c[1] && y <= c[1] + c[3]) return 100;
+    const t = this._ctlRect;
+    if (t[2] > 0 && x >= t[0] && x <= t[0] + t[2] && y >= t[1] && y <= t[1] + t[3]) return 101;
+    return -1;
+  }
+  hitTest(x, y) { return this._hitAt(x, y) >= 0; }
+  onPointer(x, y) {
+    const h = this._hitAt(x, y);
+    if (h < 0) return false;
+    if (h === 100) this.clearClip();
+    else if (h === 101) this.settings.set('mb2ExtCtrl', !this.settings.get('mb2ExtCtrl'));
+    else this.settings.set('mb2Mode', MB2.MODES[h]);
+    return true;
+  }
 
-    const leftColW = showLabels ? Math.min(170, width * 0.26) : 0;
-    const rightColW = width - leftColW;
+  /* ---------------- palette ---------------- */
+  _ensurePalette(colors) {
+    const a = colors.accent, b = colors.accent3, key = this._palKey;
+    if (key[0] === a.r && key[1] === a.g && key[2] === a.b && key[3] === b.r && key[4] === b.g && key[5] === b.b) return;
+    key[0] = a.r; key[1] = a.g; key[2] = a.b; key[3] = b.r; key[4] = b.g; key[5] = b.b;
+    const lift = (c) => [Math.min(255, c.r + (255 - c.r) * 0.2) | 0, Math.min(255, c.g + (255 - c.g) * 0.2) | 0, Math.min(255, c.b + (255 - c.b) * 0.2) | 0];
+    const zc = [[a.r, a.g, a.b], lift(a), [b.r, b.g, b.b], MB2.AMBER, MB2.RED];
+    const trackA = [0.07, 0.07, 0.08, 0.10, 0.12];
+    for (let z = 0; z < 5; z++) {
+      const c = zc[z];
+      for (let lv = 0; lv < 8; lv++) this._pal[z * 8 + lv] = `rgba(${c[0]},${c[1]},${c[2]},${(0.16 + 0.84 * lv / 7).toFixed(3)})`;
+      this._sty.track[z] = `rgba(${c[0]},${c[1]},${c[2]},${trackA[z]})`;
+    }
+    const s = this._sty;
+    s.glow = `rgba(${a.r},${a.g},${a.b},0.045)`;
+    s.grid = `rgba(${a.r},${a.g},${a.b},0.055)`;
+    s.gridHi = `rgba(${a.r},${a.g},${a.b},0.12)`;
+    s.txtDim = `rgba(${a.r},${a.g},${a.b},0.42)`;
+    s.txtMid = `rgba(${a.r},${a.g},${a.b},0.65)`;
+    s.txtBright = `rgba(${Math.min(255, a.r + 40)},${Math.min(255, a.g + 40)},${Math.min(255, a.b + 40)},0.94)`;
+    s.clipGhost = `rgba(${a.r},${a.g},${a.b},0.22)`;
+    s.pillOn = `rgba(${a.r},${a.g},${a.b},0.20)`;
+    s.pillBorderOn = `rgba(${a.r},${a.g},${a.b},0.70)`;
+    s.pillBorder = `rgba(${a.r},${a.g},${a.b},0.16)`;
+    s.balLow = `rgba(${a.r},${a.g},${a.b},0.8)`;
+    s.balMid = `rgba(${b.r},${b.g},${b.b},0.8)`;
+    s.balHigh = `rgba(${colors.accent2.r},${colors.accent2.g},${colors.accent2.b},0.8)`;
+    s.trackNeutral = `rgba(${a.r},${a.g},${a.b},0.12)`;
+  }
 
-    for (let i = 0; i < rowCount; i++) {
-      const band = bands[i];
-      const y = i * (rowHeight + rowGap);
-      const energy = audio.getBandEnergy(band.lo, band.hi) / 255 * audio.sensitivity;
+  /* ---------------- measurement + ballistics ---------------- */
+  _step(audio, now, dt) {
+    const bands = this._bands, n = this._n;
+    const mb = audio.updateMeters(bands, dt);
+    const holdMs = this.settings.get('mb2PeakHold') || 450;
+    const fall = (this.settings.get('mb2PeakFall') || 40) * dt / 1000;
+    const envFall = MB2.PEAKENV_FALL_DB_S * dt / 1000;
+    const ms = this.ms, rmsDb = this.rmsDb, inst = this.inst, hold = this.hold, holdT = this.holdT;
+    const pkEnv = this.pkEnv;
+    const slowC = 1 - Math.exp(-dt / 260), trigDecay = Math.exp(-dt / 120);
 
-      const prev = this.bandSmoothed[i];
-      const smoothed = prev + (energy - prev) * (energy > prev ? 0.5 : 0.1);
-      this.bandSmoothed[i] = smoothed;
+    // SENS / GAIN / SMOOTH only count when the button is on; off = calibrated.
+    // SENS x GAIN offsets every level; SMOOTH stretches/shrinks the meter's own
+    // response times (neutral at the engine defaults, so 'on' at defaults = no change).
+    let g = 1, tm = 1;
+    if (this.settings.get('mb2ExtCtrl')) {
+      g = Math.max(0, (audio.sensitivity == null ? 1 : audio.sensitivity) * (audio.gain == null ? 1 : audio.gain));
+      const s = Util.clamp(audio.smoothing == null ? MB2.NEUTRAL_SMOOTH : audio.smoothing, 0.05, 0.98);
+      tm = Util.clamp(Math.log(MB2.NEUTRAL_SMOOTH) / Math.log(s), 0.15, 12);
+    }
+    const g2 = g * g;
 
-      if (smoothed >= this.bandPeaks[i]) {
-        this.bandPeaks[i] = smoothed;
-        this.bandPeakHold[i] = now + 900;
-      } else if (now > this.bandPeakHold[i]) {
-        this.bandPeaks[i] = Math.max(smoothed, this.bandPeaks[i] - 0.006);
+    for (let i = 0; i < n; i++) {
+      const pL = mb ? mb.pow[i * 2] * g2 : 0, pR = mb ? mb.pow[i * 2 + 1] * g2 : 0;
+      const resp = this.resp[i];
+      const ca = 1 - Math.exp(-dt / (resp[0] * tm)), cr = 1 - Math.exp(-dt / (resp[1] * tm));
+      for (let j = 0; j < 3; j++) {
+        const k = i * 3 + j;
+        const p = j === 0 ? pL : j === 1 ? pR : (pL + pR) * 0.5;
+        const m = ms[k];
+        const nm = m + (p - m) * (p > m ? ca : cr);
+        ms[k] = nm;
+        const x = p > 1e-12 ? 10 * Math.log10(p) : -120;
+        const r = nm > 1e-12 ? 10 * Math.log10(nm) : -120;
+        inst[k] = x;
+        rmsDb[k] = r;
+        const c = x > r ? x : r;                       // a peak is never below the RMS it rides on
+        // Peak hold: instant attack, hold, then a steady fall.
+        if (c >= hold[k]) { hold[k] = c; holdT[k] = now + holdMs; }
+        else if (now > holdT[k]) { const h = hold[k] - fall; hold[k] = h > c ? h : c; }
+        // Peak-mode envelope (fast attack, quick release)
+        if (c >= pkEnv[k]) pkEnv[k] = c; else { const e = pkEnv[k] - envFall; pkEnv[k] = e > c ? e : c; }
       }
-
-      const t = rowCount > 1 ? i / (rowCount - 1) : 0;
-      const c = t < 0.4 ? colors.accent : t < 0.75 ? colors.accent3 : colors.accent2;
-
-      if (showLabels) {
-        this._drawLeftColumn(ctx, band, y, rowHeight, colors, smoothed);
+      // Transient detection on the mix: a sudden jump over the slow average
+      const pm = (pL + pR) * 0.5, xm = inst[i * 3 + 2];
+      const slowDb = this.slow[i] > 1e-12 ? 10 * Math.log10(this.slow[i]) : -120;
+      const rise = xm - slowDb;
+      if (this.armed[i] && rise > resp[2] && xm > -50 && now - this.lastTrig[i] > 90) {
+        this.trig[i] = 1; this.lastTrig[i] = now; this.armed[i] = 0;
       } else {
-        ctx.font = '400 9px "JetBrains Mono", monospace';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = `rgba(${colors.accent.r},${colors.accent.g},${colors.accent.b},0.55)`;
-        ctx.fillText(band.name, 4, y + rowHeight / 2);
+        this.trig[i] *= trigDecay;
+        if (!this.armed[i] && rise < resp[2] * 0.5) this.armed[i] = 1;
       }
-      this._drawSegmentedMeter(ctx, width, rightColW, y, rowHeight, smoothed, this.bandPeaks[i], colors, c);
+      this.slow[i] += (pm - this.slow[i]) * slowC;
+      const b = (pR - pL) / (pR + pL + 1e-9);
+      this.balance[i] += (b - this.balance[i]) * 0.15;
+    }
+
+    // ----- master -----
+    const ca = 1 - Math.exp(-dt / (MB2.MASTER_ATTACK * tm)), cr = 1 - Math.exp(-dt / (MB2.MASTER_RELEASE * tm));
+    let pkNow = -120;
+    for (let c = 0; c < 2; c++) {
+      const pk = mb ? mb.peak[c] * g : 0;
+      const x = pk > 1e-6 ? 20 * Math.log10(pk) : -120;
+      if (x > pkNow) pkNow = x;
+      const m = mb ? 2 * mb.ms[c] * g2 : 0;               // sine FS = 1.0 -> 0 dB, same scale as the bands
+      const sm = this.mMs[c];
+      const nm = sm + (m - sm) * (m > sm ? ca : cr);
+      this.mMs[c] = nm;
+      const r = nm > 1e-12 ? 10 * Math.log10(nm) : -120;
+      this.mRmsDb[c] = r;
+      const cand = x > r ? x : r;
+      if (cand >= this.mHold[c]) { this.mHold[c] = cand; this.mHoldT[c] = now + holdMs; }
+      else if (now > this.mHoldT[c]) { const h = this.mHold[c] - fall; this.mHold[c] = h > cand ? h : cand; }
+    }
+    // headline PEAK stat: holds ~2 s, then eases down
+    if (pkNow >= this.statPk) { this.statPk = pkNow; this.statPkT = now + 2000; }
+    else if (now > this.statPkT) { const h = this.statPk - 10 * dt / 1000; this.statPk = h > pkNow ? h : pkNow; }
+    const avg = 0.5 * (this.mMs[0] + this.mMs[1]);
+    this.statRms = avg > 1e-12 ? 10 * Math.log10(avg) : -120;
+    // LUFS (K-weighted, ~3 s window, -70 LUFS absolute gate)
+    if (mb) {
+      const kms = mb.kms * g2;
+      if (kms > 1e-12 && -0.691 + 10 * Math.log10(kms) > -70) {
+        this.lufsMs = this.lufsMs === 0 ? kms : this.lufsMs + (kms - this.lufsMs) * (1 - Math.exp(-dt / MB2.LUFS_TAU_MS));
+      }
+      // Real clip detection: actual sample values at/over 0.999 of full scale.
+      if (mb.clip) { this.clipUntil = now + MB2.CLIP_LATCH_MS; this.clipCount++; }
+    }
+    // overall spectral balance (low / mid / high share of band energy)
+    let lo = 0, mi = 0, hi = 0;
+    for (let i = 0; i < n; i++) { const e = ms[i * 3 + 2]; if (this.grp[i] === 0) lo += e; else if (this.grp[i] === 1) mi += e; else hi += e; }
+    const tot = lo + mi + hi;
+    if (tot > 1e-9) {
+      const sc = 1 - Math.exp(-dt / 250);
+      this.shares[0] += (lo / tot - this.shares[0]) * sc;
+      this.shares[1] += (mi / tot - this.shares[1]) * sc;
+      this.shares[2] += (hi / tot - this.shares[2]) * sc;
+    }
+  }
+
+  _refreshText(now) {
+    if (now - this._textAt < 66) return;
+    this._textAt = now;
+    const f1 = (db) => (db <= -99 ? '-∞' : db.toFixed(1));
+    for (let i = 0; i < this._n; i++) {
+      const k = i * 3 + 2;
+      this.rmsTxt[i] = `${f1(this.rmsDb[k])} dB`;
+      this.pkTxt[i] = `PEAK ${f1(this.hold[k])} dB`;
+      const crest = this.hold[k] - this.rmsDb[k];
+      this.crestTxt[i] = this.rmsDb[k] <= -99 ? '' : `CF ${crest.toFixed(1)}`;
+    }
+    const t = this.txt;
+    const silent = this.statPk <= -99 || this.statRms <= -99;
+    t.pk = f1(this.statPk);
+    t.rms = f1(this.statRms);
+    t.lufs = this.lufsMs > 1e-9 ? (-0.691 + 10 * Math.log10(this.lufsMs)).toFixed(1) : '-∞';
+    t.dyn = silent ? '—' : Math.max(0, this.statPk - this.statRms).toFixed(1);
+    t.pkU = this.statPk <= -99 ? t.pk : t.pk + ' dB';
+    t.rmsU = this.statRms <= -99 ? t.rms : t.rms + ' dB';
+    t.dynU = silent ? t.dyn : t.dyn + ' dB';
+  }
+
+  /* ---------------- geometry ---------------- */
+  _makeGeo(stripW, segH, k) {
+    const segCount = Util.clamp(Math.round(stripW / (10.5 * k)), 28, MB2.MAX_SEG);
+    const pitch = stripW / segCount;
+    const gap = Math.max(1, pitch * 0.22);
+    const segW = pitch - gap;
+    const zone = new Uint8Array(segCount);
+    const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+    const e = MB2.ZONE_EDGES;
+    for (let s = 0; s < segCount; s++) {
+      const d = MB2.MIN_DB + (-MB2.MIN_DB) * ((s + 0.5) / segCount);
+      const z = d < e[0] ? 0 : d < e[1] ? 1 : d < e[2] ? 2 : d < e[3] ? 3 : 4;
+      zone[s] = z;
+      paths[z].rect(s * pitch, 0, segW, segH);
+    }
+    return { segCount, pitch, segW, segH, zone, paths, w: stripW, h: segH, k };
+  }
+
+  /** Returns the cached geometry for a slot, rebuilding only if the size changed. */
+  _useGeo(slot, stripW, segH, k) {
+    const cur = this._geo[slot];
+    if (cur && cur.w === stripW && cur.h === segH && cur.k === k) return cur;
+    return (this._geo[slot] = this._makeGeo(stripW, segH, k));
+  }
+
+  _computeLayout(W, H, k, ctx) {
+    const L = this.L;
+    const cssH = H / k;
+    L.k = k;
+    L.narrow = W / k < 720;
+    L.leftW = Math.min(170 * k, W * 0.26);
+    const readoutW = 64 * k;
+    L.stripX = L.leftW;
+    L.stripW = Math.max(60 * k, W - L.leftW - readoutW - 10 * k);
+    const hdrH = 40 * k;
+    L.masterH = (cssH < 470 ? 64 : 86) * k;
+    L.masterY = hdrH;
+    L.laneH = (cssH < 470 ? 12 : 15) * k;
+    const lanesTotal = L.laneH * 2 + 4 * k;
+    L.lanesTop = L.masterY + (L.masterH - (lanesTotal + 14 * k)) / 2 + 2 * k;
+    const n = this._n;
+    L.rowGap = (n > 10 ? 3 : 5) * k;
+    L.rowsY = L.masterY + L.masterH + 6 * k;
+    L.rowH = (H - L.rowsY - 4 * k - L.rowGap * (n - 1)) / n;
+    L.segH = Util.clamp(L.rowH * 0.5, 8 * k, 22 * k);
+
+    // pill widths depend on font + narrow flag, so measure only when layout changes
+    ctx.font = `600 ${9 * k}px "JetBrains Mono", monospace`;
+    let x = W - 14 * k;
+    const py = 10 * k, ph = 20 * k;
+    for (let m = 5; m >= 0; m--) {
+      const label = MB2.LABELS[MB2.MODES[m]][L.narrow ? 1 : 0];
+      const w = ctx.measureText(label).width + 16 * k;
+      this._pillW[m] = w;
+      x -= w;
+      this._hit[m * 4] = x; this._hit[m * 4 + 1] = py; this._hit[m * 4 + 2] = w; this._hit[m * 4 + 3] = ph;
+      x -= 5 * k;
+    }
+    // SENS/GAIN/SMOOTH enable button, sized for its longer ("OFF") state so it never jitters
+    const base = MB2.CTL_LABEL[L.narrow ? 1 : 0];
+    this._ctlLbl.on = `${base} · ON`;
+    this._ctlLbl.off = `${base} · OFF`;
+    const cw = ctx.measureText(this._ctlLbl.off).width + 16 * k;
+    this._ctlRect[0] = x - 5 * k - cw; this._ctlRect[1] = py; this._ctlRect[2] = cw; this._ctlRect[3] = ph;
+  }
+
+  /* ---------------- drawing ---------------- */
+  /** One segmented strip. `fill` is a 0..1 fraction of the dB scale. */
+  _strip(ctx, geo, x, y, fill, trans, forceTop) {
+    const sc = geo.segCount, pitch = geo.pitch, segW = geo.segW, segH = geo.segH, zone = geo.zone, pal = this._pal, sty = this._sty;
+    ctx.save();
+    ctx.translate(x, y);
+    for (let z = 0; z < 5; z++) { ctx.fillStyle = sty.track[z]; ctx.fill(geo.paths[z]); }
+    const head = fill * sc;
+    if (head > 0.2) { ctx.fillStyle = sty.glow; ctx.fillRect(-2, -3, head * pitch + 4, segH + 6); }
+    const headSeg = Math.floor(head);
+    const base = MB2.ZONE_BASE;
+    let last = '';
+    for (let s = 0; s < sc; s++) {
+      let cover = head - s;
+      cover = cover <= 0 ? 0 : cover >= 1 ? 1 : cover;
+      let i = 0;
+      if (cover > 0) {
+        i = cover * base[zone[s]];
+        if (trans > 0.02 && s >= headSeg - 5) i += 0.4 * trans;   // brief lift of the segments at the head
+      }
+      if (forceTop && s >= sc - 5) i = 1;
+      if (i > 1) i = 1;
+      if (i < 0.04) continue;                                    // live level only — no afterglow from earlier frames
+      const st = pal[zone[s] * 8 + (i >= 1 ? 7 : (i * 8) | 0)];
+      if (st !== last) { ctx.fillStyle = st; last = st; }
+      ctx.fillRect(s * pitch, 0, segW, segH);
+    }
+    ctx.restore();
+  }
+
+  _stat(ctx, label, val, sx, sy, colW, k) {
+    ctx.fillStyle = this._sty.txtDim; ctx.textAlign = 'left'; ctx.fillText(label, sx, sy);
+    ctx.fillStyle = this._sty.txtBright; ctx.textAlign = 'right'; ctx.fillText(val, sx + colW, sy);
+  }
+
+  _zoneOf(db) {
+    const e = MB2.ZONE_EDGES;
+    return db < e[0] ? 0 : db < e[1] ? 1 : db < e[2] ? 2 : db < e[3] ? 3 : 4;
+  }
+
+  _holdMarker(ctx, x, y, w, segH, holdDb, k, withArrow) {
+    const f = (holdDb - MB2.MIN_DB) / -MB2.MIN_DB;
+    if (f < 0.02) return;
+    const mx = x + (f > 1 ? 1 : f) * w;
+    const z = this._zoneOf(holdDb);
+    ctx.fillStyle = z >= 3 ? this._pal[z * 8 + 7] : this._sty.marker;
+    ctx.fillRect(mx - 1 * k, y - 2 * k, 2 * k, segH + 4 * k);
+    if (withArrow) {
+      ctx.beginPath();
+      ctx.moveTo(mx, y + segH + 2.5 * k);
+      ctx.lineTo(mx - 3 * k, y + segH + 7 * k);
+      ctx.lineTo(mx + 3 * k, y + segH + 7 * k);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  draw(audio, now, dt) {
+    const ctx = this.ctx;
+    const W = this.width, H = this.height;
+    const k = Math.max(0.75, this.dpr || 1);
+    dt = Util.clamp(dt || this._lastDt, 1, 100);
+    this._lastDt = dt;
+    if (!this._bands) { this._bands = audio.getMeterBank2Bands(); this._alloc(this._bands.length); }
+    const colors = this.theme.getAccentColors();
+    this._ensurePalette(colors);
+
+    let mode = this.settings.get('mb2Mode');
+    if (MB2.MODES.indexOf(mode) < 0) mode = 'peakrms';
+
+    if (!audio.isPaused) this._step(audio, now, dt);
+    this._refreshText(now);
+
+    const key = `${W}|${H}|${k}`;
+    if (key !== this._layoutKey) { this._layoutKey = key; this._computeLayout(W, H, k, ctx); }
+    const L = this.L, sty = this._sty, pal = this._pal, n = this._n;
+    const geoRow = this._useGeo('row', L.stripW, L.segH, k);
+    const geoLane = this._useGeo('lane', L.stripW, Math.max(3 * k, (L.segH - 1.5 * k) / 2), k);
+    const geoMaster = this._useGeo('master', L.stripW, L.laneH, k);
+
+    const stereoMode = mode === 'stereo';
+    const showHold = mode !== 'rms';
+    const showTrans = mode === 'peakrms' || mode === 'precision' || mode === 'peak';
+    const showPeakTxt = mode === 'peak' || mode === 'peakrms' || mode === 'precision';
+    const showBal = mode === 'stereo' || mode === 'precision';
+    const precision = mode === 'precision';
+    const clipActive = now < this.clipUntil;
+    const frac = mb2Frac;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.textBaseline = 'middle';
+
+    // ===== header: meter-mode pills =====
+    const cur = MB2.MODES.indexOf(mode);
+    ctx.font = `600 ${9 * k}px "JetBrains Mono", monospace`;
+    ctx.textAlign = 'center';
+    for (let m = 0; m < 6; m++) {
+      const o = m * 4, px = this._hit[o], py = this._hit[o + 1], pw = this._hit[o + 2], ph = this._hit[o + 3];
+      const on = m === cur;
+      this._roundRect(ctx, px, py, pw, ph, ph / 2);
+      if (on) { ctx.fillStyle = sty.pillOn; ctx.fill(); }
+      ctx.strokeStyle = on ? sty.pillBorderOn : sty.pillBorder;
+      ctx.lineWidth = Math.max(1, k * 0.8);
+      ctx.stroke();
+      ctx.fillStyle = on ? sty.txtBright : sty.txtDim;
+      ctx.fillText(MB2.LABELS[MB2.MODES[m]][L.narrow ? 1 : 0], px + pw / 2, py + ph / 2 + 0.5 * k);
+    }
+    {
+      const cr = this._ctlRect, ext = !!this.settings.get('mb2ExtCtrl');
+      this._roundRect(ctx, cr[0], cr[1], cr[2], cr[3], cr[3] / 2);
+      if (ext) { ctx.fillStyle = sty.pillOn; ctx.fill(); }
+      ctx.strokeStyle = ext ? sty.pillBorderOn : sty.pillBorder;
+      ctx.lineWidth = Math.max(1, k * 0.8);
+      ctx.stroke();
+      ctx.fillStyle = ext ? sty.txtBright : sty.txtDim;
+      ctx.fillText(ext ? this._ctlLbl.on : this._ctlLbl.off, cr[0] + cr[2] / 2, cr[1] + cr[3] / 2 + 0.5 * k);
+    }
+    ctx.textAlign = 'left';
+
+    // ===== dB grid (behind everything) + scale under the master =====
+    const lanesBottom = L.lanesTop + L.laneH * 2 + 4 * k;
+    const gridBottom = L.rowsY + n * (L.rowH + L.rowGap) - L.rowGap;
+    ctx.lineWidth = Math.max(1, k * 0.8);
+    ctx.beginPath();
+    ctx.strokeStyle = sty.grid;
+    for (let t = 0; t < MB2.TICKS.length - 1; t++) {
+      const gx = Math.round(L.stripX + frac(MB2.TICKS[t]) * L.stripW) + 0.5;
+      ctx.moveTo(gx, lanesBottom + 2 * k); ctx.lineTo(gx, gridBottom);
+    }
+    ctx.stroke();
+    ctx.font = `500 ${8.5 * k}px "JetBrains Mono", monospace`;
+    ctx.textAlign = 'center';
+    for (let t = 0; t < MB2.TICKS.length; t++) {
+      const db = MB2.TICKS[t];
+      const gx = L.stripX + frac(db) * L.stripW;
+      ctx.fillStyle = db >= -6 ? sty.txtMid : sty.txtDim;
+      ctx.fillText(db === 0 ? '0 dB' : String(db), gx, lanesBottom + 9 * k);
+      ctx.fillRect(Math.round(gx) - 0.5 * k, lanesBottom + 1.5 * k, Math.max(1, k * 0.8), 2.5 * k);
+    }
+    ctx.textAlign = 'left';
+
+    // ===== master section =====
+    const mx = 14 * k;
+    ctx.font = `700 ${10.5 * k}px "Space Grotesk", sans-serif`;
+    ctx.fillStyle = sty.txtBright;
+    ctx.fillText('MASTER', mx, L.masterY + 11 * k);
+    // CLIP indicator (also the clear button)
+    const cw = 34 * k, ch = 14 * k, cx = mx + 62 * k, cy = L.masterY + 4 * k;
+    this._clipRect[0] = cx; this._clipRect[1] = cy; this._clipRect[2] = cw; this._clipRect[3] = ch;
+    ctx.font = `700 ${8.5 * k}px "JetBrains Mono", monospace`;
+    ctx.textAlign = 'center';
+    if (clipActive) {
+      ctx.fillStyle = sty.clipOn;
+      this._roundRect(ctx, cx, cy, cw, ch, 3 * k);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+    } else {
+      ctx.fillStyle = sty.clipGhost;
+    }
+    ctx.fillText('CLIP', cx + cw / 2, cy + ch / 2 + 0.5 * k);
+    ctx.textAlign = 'left';
+
+    // compact statistics (2 x 2)
+    const stacked = L.masterH >= 80 * k;
+    const yR1 = L.masterY + 25 * k;
+    ctx.font = `500 ${9 * k}px "JetBrains Mono", monospace`;
+    let statsBottom;
+    if (stacked) {
+      const w = L.leftW - mx - 28 * k, step = 11.5 * k, t = this.txt;
+      this._stat(ctx, 'PEAK', t.pkU, mx, yR1, w, k);
+      this._stat(ctx, 'RMS', t.rmsU, mx, yR1 + step, w, k);
+      this._stat(ctx, 'LUFS', t.lufs, mx, yR1 + step * 2, w, k);
+      this._stat(ctx, 'DYNAMIC', t.dynU, mx, yR1 + step * 3, w, k);
+      statsBottom = yR1 + step * 3;
+    } else {
+      const colW = (L.leftW - mx - 22 * k) / 2, t = this.txt;
+      this._stat(ctx, 'PEAK', t.pk, mx, yR1, colW, k);
+      this._stat(ctx, 'RMS', t.rms, mx + colW, yR1, colW, k);
+      this._stat(ctx, 'LUFS', t.lufs, mx, yR1 + 12 * k, colW, k);
+      this._stat(ctx, 'DYN', t.dyn, mx + colW, yR1 + 12 * k, colW, k);
+      statsBottom = yR1 + 12 * k;
+    }
+    ctx.textAlign = 'left';
+    if (precision && stacked) {
+      // overall spectral balance: a thin low | mid | high split, only in Precision
+      const by = statsBottom + 9 * k, bw = L.leftW - mx - 28 * k, bh = 4 * k;
+      ctx.fillStyle = sty.trackNeutral;
+      ctx.fillRect(mx, by, bw, bh);
+      const s0 = this.shares[0] * bw, s1 = this.shares[1] * bw;
+      ctx.fillStyle = sty.balLow; ctx.fillRect(mx, by, Math.max(0, s0 - 1), bh);
+      ctx.fillStyle = sty.balMid; ctx.fillRect(mx + s0, by, Math.max(0, s1 - 1), bh);
+      ctx.fillStyle = sty.balHigh; ctx.fillRect(mx + s0 + s1, by, Math.max(0, bw - s0 - s1), bh);
+      ctx.font = `500 ${7.5 * k}px "JetBrains Mono", monospace`;
+      ctx.fillStyle = sty.txtDim;
+      ctx.fillText('LOW · MID · HIGH', mx, by + bh + 7 * k);
+    }
+
+    // master L / R lanes
+    for (let c = 0; c < 2; c++) {
+      const ly = L.lanesTop + c * (L.laneH + 4 * k);
+      this._strip(ctx, geoMaster, L.stripX, ly, frac(this.mRmsDb[c]), 0, clipActive);
+      this._holdMarker(ctx, L.stripX, ly, L.stripW, L.laneH, this.mHold[c], k, false);
+      ctx.font = `600 ${8.5 * k}px "JetBrains Mono", monospace`;
+      ctx.fillStyle = sty.txtMid;
+      ctx.textAlign = 'right';
+      ctx.fillText(c === 0 ? 'L' : 'R', L.stripX - 6 * k, ly + L.laneH / 2 + 0.5 * k);
+      ctx.textAlign = 'left';
+    }
+    const mpk = Math.max(this.mHold[0], this.mHold[1]);
+    ctx.font = `500 ${9 * k}px "JetBrains Mono", monospace`;
+    ctx.fillStyle = mpk >= -3 ? pal[this._zoneOf(mpk) * 8 + 7] : sty.txtMid;
+    ctx.fillText(mpk <= -99 ? '-∞ dB' : `${mpk.toFixed(1)} dB`, L.stripX + L.stripW + 8 * k, L.lanesTop + L.laneH + 2 * k);
+
+    // ===== band rows =====
+    const bands = this._bands;
+    const showHz = L.rowH >= 22 * k;
+    const lineCount = 1 + (showHz ? 1 : 0) + (showPeakTxt && L.rowH >= 42 * k ? 1 : 0);
+    for (let i = 0; i < n; i++) {
+      const band = bands[i];
+      const y = L.rowsY + i * (L.rowH + L.rowGap);
+      const cyRow = y + L.rowH / 2;
+      const km = i * 3 + 2;
+      const level = frac(this.rmsDb[km]);
+
+      // --- left column: glyph, name, Hz, (peak)
+      ctx.fillStyle = `rgba(${colors.accent.r},${colors.accent.g},${colors.accent.b},${0.5 + level * 0.5})`;
+      ctx.save();
+      ctx.scale(k, k);
+      this._drawBandGlyph(ctx, 16, cyRow / k, band.icon, colors, level);
+      ctx.restore();
+      const lh = this._lh;
+      lh[0] = 13 * k; lh[1] = 11 * k; lh[2] = 11 * k;
+      let blockH = 0;
+      for (let l = 0; l < lineCount; l++) blockH += lh[l];
+      let ty = cyRow - blockH / 2 + lh[0] / 2;
+      ctx.font = `600 ${12 * k}px "Space Grotesk", sans-serif`;
+      ctx.fillStyle = sty.txtBright;
+      ctx.fillText(band.name, 40 * k, ty);
+      ctx.font = `400 ${9 * k}px "JetBrains Mono", monospace`;
+      if (showHz) { ty += (lh[0] + lh[1]) / 2; ctx.fillStyle = sty.txtDim; ctx.fillText(this.hzTxt[i], 40 * k, ty); }
+      if (lineCount > 2) { ty += lh[1] / 2 + lh[2] / 2; ctx.fillStyle = sty.txtMid; ctx.fillText(this.pkTxt[i], 40 * k, ty); }
+
+      // --- the strip(s)
+      const sy = cyRow - L.segH / 2;
+      if (stereoMode) {
+        const laneH = geoLane.segH;
+        for (let c = 0; c < 2; c++) {
+          const ly = sy + c * (laneH + 1.5 * k);
+          const kk = i * 3 + c;
+          this._strip(ctx, geoLane, L.stripX, ly, frac(this.rmsDb[kk]), 0, false);
+          this._holdMarker(ctx, L.stripX, ly, L.stripW, laneH, this.hold[kk], k, false);
+        }
+        ctx.font = `600 ${7.5 * k}px "JetBrains Mono", monospace`;
+        ctx.fillStyle = sty.txtDim;
+        ctx.textAlign = 'right';
+        ctx.fillText('L', L.stripX - 5 * k, sy + laneH / 2);
+        ctx.fillText('R', L.stripX - 5 * k, sy + laneH * 1.5 + 1.5 * k);
+        ctx.textAlign = 'left';
+      } else {
+        const fillDb = mode === 'peak' ? this.pkEnv[km] : this.rmsDb[km];
+        const tr = showTrans ? this.trig[i] : 0;
+        this._strip(ctx, geoRow, L.stripX, sy, frac(fillDb), tr, false);
+        if (showHold) this._holdMarker(ctx, L.stripX, sy, L.stripW, L.segH, this.hold[km], k, L.rowH >= 36 * k);
+        if (tr > 0.05) {
+          // transient marker: a small dot just past the strip, fading in ~0.25 s
+          ctx.globalAlpha = Math.min(1, tr);
+          ctx.fillStyle = sty.marker;
+          ctx.beginPath();
+          ctx.arc(L.stripX + L.stripW + 6 * k, cyRow, 2.6 * k, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+      }
+
+      // --- right readout (RMS dB), + crest / balance in Precision / Stereo
+      const rx = W - 6 * k;
+      ctx.font = `500 ${9.5 * k}px "JetBrains Mono", monospace`;
+      ctx.textAlign = 'right';
+      const two = (showBal || precision) && L.rowH >= 34 * k;
+      const three = two && precision && !stereoMode && L.rowH >= 46 * k;
+      ctx.fillStyle = sty.txtBright;
+      ctx.fillText(this.rmsTxt[i], rx, three ? cyRow - 11 * k : two ? cyRow - 7 * k : cyRow);
+      if (two) {
+        if (three && this.crestTxt[i]) {
+          ctx.font = `400 ${8 * k}px "JetBrains Mono", monospace`;
+          ctx.fillStyle = sty.txtDim;
+          ctx.fillText(this.crestTxt[i], rx, cyRow + 1 * k);
+        }
+        if (showBal) {
+          const bw = 34 * k, bx = rx - bw, by = cyRow + (three ? 11 : 8) * k;
+          ctx.fillStyle = sty.trackNeutral;
+          ctx.fillRect(bx, by, bw, 3 * k);
+          ctx.fillStyle = sty.txtMid;
+          ctx.fillRect(bx + bw / 2 - 0.5 * k, by - 1.5 * k, Math.max(1, k), 6 * k);          // centre tick
+          const dot = bx + bw / 2 + Util.clamp(this.balance[i], -1, 1) * (bw / 2 - 2 * k);
+          ctx.fillStyle = sty.txtBright;
+          ctx.fillRect(dot - 2 * k, by - 1 * k, 4 * k, 5 * k);
+        }
+      }
+      ctx.textAlign = 'left';
     }
   }
 
   reset() {
-    this.bandSmoothed.fill(0);
-    this.bandPeaks.fill(0);
+    if (this._n) {
+      this.ms.fill(0); this.rmsDb.fill(-120); this.inst.fill(-120); this.hold.fill(-120); this.holdT.fill(0);
+      this.pkEnv.fill(-120); this.slow.fill(0); this.armed.fill(1); this.trig.fill(0);
+      this.lastTrig.fill(0); this.balance.fill(0);
+      this.rmsTxt.fill('-∞ dB'); this.pkTxt.fill(''); this.crestTxt.fill('');
+    }
+    this.mMs.fill(0); this.mRmsDb.fill(-120); this.mHold.fill(-120); this.mHoldT.fill(0);
+    this.statPk = -120; this.statPkT = 0; this.statRms = -120; this.lufsMs = 0;
+    this.clipUntil = 0; this.clipCount = 0;
+    this.shares.fill(1 / 3);
+    this.txt.pk = this.txt.rms = this.txt.lufs = this.txt.dyn = this.txt.pkU = this.txt.rmsU = this.txt.dynU = '—';
+    this._textAt = 0;
   }
 }
+
 
 /* ---------------- MODE: SIGNAL METER (Volume / Frequency + 3 essentials) ----------------
    A dedicated, always-5-row segmented meter bank for the handful of
@@ -2404,8 +4126,7 @@ class WarpViz extends Visualizer {
     while (this.stars.length < count) this.stars.push(this._spawn(true));
     if (this.stars.length > count) this.stars.length = count;
 
-    ctx.fillStyle = 'rgba(0,0,0,0.30)';
-    ctx.fillRect(0, 0, width, height);
+    ctx.clearRect(0, 0, width, height);
 
     if (m.bass - this.prevBass > 0.12 && m.bass > 0.25) this.punch = 1;
     this.prevBass = Util.lerp(this.prevBass, m.bass, 0.5);
@@ -2467,8 +4188,7 @@ class RipplesViz extends Visualizer {
     const cx = width / 2, cy = height / 2;
     const minDim = Math.min(width, height), maxR = Math.hypot(width, height) / 2;
 
-    ctx.fillStyle = 'rgba(0,0,0,0.24)';
-    ctx.fillRect(0, 0, width, height);
+    ctx.clearRect(0, 0, width, height);
 
     // Spawn a shockwave on each bass onset (plus a quiet ambient one now and then)
     this.avgBass = Util.lerp(this.avgBass, m.bass, 0.06);
@@ -2541,8 +4261,7 @@ class ScopeViz extends Visualizer {
     const t = audio.timeData, n = t.length;
     const cx = width / 2, cy = height / 2, R = Math.min(width, height) * 0.44;
 
-    ctx.fillStyle = 'rgba(0,0,0,0.16)';
-    ctx.fillRect(0, 0, width, height);
+    ctx.clearRect(0, 0, width, height);
 
     // Graticule
     ctx.strokeStyle = `rgba(${c.accent.r},${c.accent.g},${c.accent.b},0.10)`;
@@ -2749,6 +4468,37 @@ class AnimationEngine {
     document.addEventListener('visibilitychange', this._onVisibilityChange);
 
     this._resizeObserver = new ResizeObserver(() => this._handleResize());
+    // Capped device-pixel-ratio for the canvas buffer. Lite Mode lowers
+    // this to 1 (a real resolution cut — fewer pixels to fill every frame,
+    // less GPU/RAM), normal use caps it at 2.5 to avoid wasting fill-rate
+    // on displays with absurdly high DPR.
+    this.dprCap = 2.5;
+
+    // Modes with clickable on-canvas controls (Meter Bank 2's mode pills and
+    // CLIP indicator) expose hitTest/onPointer in canvas pixel coordinates.
+    this._pointerTarget = () => {
+      let m = this.currentMode;
+      if (m && m === this.modes.auto && m.siblings) m = m.siblings[m.activeKey] || m;
+      return m && m.onPointer ? m : null;
+    };
+    const toCanvas = (e) => {
+      const r = canvas.getBoundingClientRect();
+      return [(e.clientX - r.left) * (canvas.width / Math.max(1, r.width)), (e.clientY - r.top) * (canvas.height / Math.max(1, r.height))];
+    };
+    canvas.addEventListener('click', (e) => {
+      const m = this._pointerTarget();
+      if (!m) return;
+      const [x, y] = toCanvas(e);
+      m.onPointer(x, y);
+    });
+    canvas.addEventListener('mousemove', (e) => {
+      const m = this._pointerTarget();
+      if (!m) { if (canvas.style.cursor) canvas.style.cursor = ''; return; }
+      const [x, y] = toCanvas(e);
+      const over = m.hitTest(x, y);
+      const want = over ? 'pointer' : '';
+      if (canvas.style.cursor !== want) canvas.style.cursor = want;
+    });
   }
 
   observe(container) {
@@ -2756,9 +4506,17 @@ class AnimationEngine {
     this._handleResize();
   }
 
+  /** Forces the next _handleResize to actually reallocate the canvas even
+   *  if its CSS size hasn't changed, by invalidating the cached buffer size. */
+  setDprCap(cap) {
+    this.dprCap = cap;
+    this.canvas.width = 0;
+    this._handleResize();
+  }
+
   _handleResize() {
     const rect = this.canvas.getBoundingClientRect();
-    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const dpr = Math.min(window.devicePixelRatio || 1, this.dprCap);
     const w = Math.max(1, Math.round(rect.width * dpr));
     const h = Math.max(1, Math.round(rect.height * dpr));
     if (this.canvas.width !== w || this.canvas.height !== h) {
@@ -2897,12 +4655,19 @@ const AUTO_PEAK_TARGET = {
    full-canvas pixel copies, hundreds of individually alpha-blended shapes,
    or several overlapping blur/glow layers). */
 const HEAVY_MODES = {
-  particles: 'Draws hundreds of individually alpha-blended particles every frame.',
+  particles: 'Draws hundreds of individually alpha-blended, frequency-sampled particles every frame, plus halo fills and burst connections on bass hits.',
   warp: 'Renders a large moving starfield with glow and a recomputed radial gradient every frame.',
   waterfall: 'Copies and redraws a full-resolution scrolling image buffer every frame.',
   ripples: 'Layers several overlapping blurred glow rings and gradients every frame.',
   scope: 'Uses additive blending and glow across two full traces every frame.',
+  orchestra2: 'Layers trails, additive glow strokes, a central energy field and a pooled particle system across every band row each frame. Pick the Minimal style in Settings for a much lighter version.',
 };
+
+/* The small set of visualizations Lite Mode restricts you to — each is a
+   handful of strokes/fills per frame with no glow-heavy gradients, no
+   per-frame full-canvas pixel copies, and no hundreds-of-shapes overdraw,
+   so they stay cheap even at higher frame rates. */
+const LITE_MODES = ['spectrum', 'waveform1', 'linegraph1', 'meterbank'];
 
 class UIController {
   constructor() {
@@ -2922,6 +4687,8 @@ class UIController {
     this.isRecording = false;
     this._autoTune = null;
     this._perfWarnKey = null;
+    this.liteMode = false;
+    this._litePrev = null;
     this._autoKey = null;
     this._autoEnergy = 0;
     this._autoState = null;
@@ -2996,6 +4763,8 @@ class UIController {
       btnThemeMode: document.getElementById('btnThemeMode'),
       btnFullscreen: document.getElementById('btnFullscreen'),
       btnPip: document.getElementById('btnPip'),
+      btnLiteMode: document.getElementById('btnLiteMode'),
+      liteBadge: document.getElementById('liteBadge'),
       btnScreenshot: document.getElementById('btnScreenshot'),
       btnRecord: document.getElementById('btnRecord'),
       btnSettings: document.getElementById('btnSettings'),
@@ -3014,10 +4783,18 @@ class UIController {
       selFftSize: document.getElementById('selFftSize'),
       vFftSize: document.getElementById('vFftSize'),
       selTargetFps: document.getElementById('selTargetFps'),
+      selOrchStyle: document.getElementById('selOrchStyle'),
+      vOrchStyle: document.getElementById('vOrchStyle'),
       selLatencyHint: document.getElementById('selLatencyHint'),
       vLatencyHint: document.getElementById('vLatencyHint'),
       rngBarCount: document.getElementById('rngBarCount'),
       rngBandRows: document.getElementById('rngBandRows'),
+      selMb2Mode: document.getElementById('selMb2Mode'),
+      rngMb2Hold: document.getElementById('rngMb2Hold'),
+      vMb2Hold: document.getElementById('vMb2Hold'),
+      rngMb2Fall: document.getElementById('rngMb2Fall'),
+      chkMb2Ext: document.getElementById('chkMb2Ext'),
+      vMb2Fall: document.getElementById('vMb2Fall'),
       vBandRows: document.getElementById('vBandRows'),
       perfWarnScrim: document.getElementById('perfWarnScrim'),
       perfWarnDialog: document.getElementById('perfWarnDialog'),
@@ -3076,12 +4853,14 @@ class UIController {
       const numLabel = special ? special.label : String(++regularIdx);
       btn.title = special?.title || `${this.modeLabels[key]} (${numLabel})`;
       btn.innerHTML = `<span class="num">${numLabel}</span><span>${this.modeLabels[key]}</span>`;
+      if (LITE_MODES.includes(key)) btn.classList.add('lite-allowed');
       btn.addEventListener('click', () => this._setMode(key));
       this.el.vizSelect.appendChild(btn);
     });
   }
 
   _setMode(key) {
+    if (this.liteMode && key !== 'auto' && !LITE_MODES.includes(key)) return; // locked to the lite set
     if (key !== 'auto') {
       this._autoTune = null;
       this._autoKey = null;
@@ -3317,6 +5096,7 @@ class UIController {
 
     this.el.btnFullscreen.addEventListener('click', () => this._toggleFullscreen());
     this.el.btnPip.addEventListener('click', () => this._togglePiP());
+    this.el.btnLiteMode.addEventListener('click', () => this._setLiteMode(!this.liteMode));
     this.el.btnScreenshot.addEventListener('click', () => this._takeScreenshot());
     this.el.btnRecord.addEventListener('click', () => this._toggleRecording());
 
@@ -3481,7 +5261,31 @@ class UIController {
       this.settings.set('mirrorMode', e.target.checked);
     });
 
-    // Row count for Orchestra Mode 2 & Line Graph 2 (7-40)
+    // Orchestra Mode 2 rendering style
+    this.el.selOrchStyle.addEventListener('change', (e) => {
+      const opt = e.target.options[e.target.selectedIndex];
+      this.settings.set('orchestraStyle', e.target.value);
+      this.el.vOrchStyle.textContent = opt ? opt.textContent.replace('Orchestra — ', '') : e.target.value;
+    });
+
+    // Meter Bank 2: meter mode (also switchable from the pills on the canvas),
+    // peak-hold time and peak fall rate
+    this.el.selMb2Mode.addEventListener('change', (e) => this.settings.set('mb2Mode', e.target.value));
+    this.settings.on('mb2Mode', (v) => { if (this.el.selMb2Mode.value !== v) this.el.selMb2Mode.value = v; });
+    this.el.chkMb2Ext.addEventListener('change', (e) => this.settings.set('mb2ExtCtrl', e.target.checked));
+    this.settings.on('mb2ExtCtrl', (v) => { if (this.el.chkMb2Ext.checked !== !!v) this.el.chkMb2Ext.checked = !!v; });
+    this.el.rngMb2Hold.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.settings.set('mb2PeakHold', v);
+      this.el.vMb2Hold.textContent = v;
+    });
+    this.el.rngMb2Fall.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.settings.set('mb2PeakFall', v);
+      this.el.vMb2Fall.textContent = v;
+    });
+
+    // Row count for Orchestra Mode 2 & Line Graph 2 (7-15)
     this.el.rngBandRows.addEventListener('input', (e) => {
       const v = parseInt(e.target.value, 10);
       this.settings.set('bandRows', v);
@@ -3607,6 +5411,66 @@ class UIController {
     }
   }
 
+  /* ---------------- LITE MODE ----------------
+     Turns down everything that costs real GPU/CPU/RAM and restricts the
+     mode toolbar to LITE_MODES, remembering whatever was active first so
+     it can all be put back exactly when toggled off. Doesn't touch
+     anything the person didn't ask to change (sensitivity, gain, theme,
+     etc.) — only the specific knobs that actually drive resource use. */
+  _setLiteMode(on) {
+    this.liteMode = on;
+    document.body.classList.toggle('lite-mode', on);
+    this.el.btnLiteMode.classList.toggle('active', on);
+    this.el.btnLiteMode.setAttribute('aria-pressed', on ? 'true' : 'false');
+    this.el.vizSelect.classList.toggle('lite-active', on);
+    this.el.liteBadge.hidden = !on;
+
+    if (on) {
+      this._litePrev = {
+        targetFps: this.settings.get('targetFps'),
+        fftSize: this.audio.fftSize,
+        glowIntensity: this.settings.get('glowIntensity'),
+        dprCap: this.engine.dprCap,
+      };
+
+      // Render loop: cap frame rate (fewer draws/sec = less CPU+GPU)
+      this.settings.set('targetFps', 30);
+      this.el.selTargetFps.value = '30';
+
+      // Analysis: a smaller FFT is noticeably cheaper per frame
+      this.audio.setFftSize(1024);
+      this.el.selFftSize.value = '1024';
+      this.el.vFftSize.textContent = '1024';
+
+      // Glow (shadowBlur) is one of the more GPU-expensive canvas ops used
+      // throughout the modes — zero it out while lite
+      this.settings.set('glowIntensity', 0);
+      this.el.rngGlow.value = 0;
+      this.el.vGlow.textContent = 0;
+
+      // Canvas resolution: this is the big one — a real pixel-count cut,
+      // especially on high-DPR displays
+      this.engine.setDprCap(1);
+
+      if (!LITE_MODES.includes(this.engine.currentModeKey)) this._setMode('spectrum');
+    } else if (this._litePrev) {
+      const prev = this._litePrev;
+      this.settings.set('targetFps', prev.targetFps);
+      this.el.selTargetFps.value = String(prev.targetFps);
+
+      this.audio.setFftSize(prev.fftSize);
+      this.el.selFftSize.value = String(prev.fftSize);
+      this.el.vFftSize.textContent = prev.fftSize;
+
+      this.settings.set('glowIntensity', prev.glowIntensity);
+      this.el.rngGlow.value = prev.glowIntensity;
+      this.el.vGlow.textContent = prev.glowIntensity;
+
+      this.engine.setDprCap(prev.dprCap);
+      this._litePrev = null;
+    }
+  }
+
   /* ---------------- SCREENSHOT ---------------- */
   _takeScreenshot() {
     if (!this.audio.isCapturing) return;
@@ -3671,6 +5535,9 @@ class UIController {
         case 'p':
           this._togglePiP();
           break;
+        case 'z':
+          this._setLiteMode(!this.liteMode);
+          break;
         case 's':
           this._takeScreenshot();
           break;
@@ -3695,6 +5562,7 @@ class UIController {
         case 'b': this._setMode('ripples'); break;
         case 'x': this._setMode('scope'); break;
         case '0': this._setMode('auto'); break;
+        case 'c': this.engine.modes.meterbank2.clearClip(); break; // clear Meter Bank 2's CLIP latch
         default: break;
       }
     });
